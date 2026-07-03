@@ -19,7 +19,8 @@ const (
 	DefaultCollInfoURL = "https://index.commoncrawl.org/collinfo.json"
 	DefaultCRTShURL    = "https://crt.sh/"
 
-	httpAttempts = 3
+	httpAttempts        = 3
+	commonCrawlPageSize = 5
 )
 
 type HTTPClient interface {
@@ -207,6 +208,7 @@ func commonCrawlQuery(indexURL string, page int, limit int) string {
 	values.Set("fl", "url")
 	if page >= 0 {
 		values.Set("page", fmt.Sprintf("%d", page))
+		values.Set("pageSize", fmt.Sprintf("%d", commonCrawlPageSize))
 	}
 	if limit > 0 {
 		values.Set("limit", fmt.Sprintf("%d", limit))
@@ -227,7 +229,7 @@ func (d *Discoverer) commonCrawlPageCount(ctx context.Context, indexURL string) 
 	values := query.Query()
 	values.Set("url", "*.cz/")
 	values.Set("showNumPages", "true")
-	values.Set("pageSize", "1000")
+	values.Set("pageSize", fmt.Sprintf("%d", commonCrawlPageSize))
 	query.RawQuery = values.Encode()
 
 	var lastErr error

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 )
 
@@ -127,5 +128,44 @@ func TestCommonCrawlContinuesAcrossIndexesUntilLimit(t *testing.T) {
 	}
 	if got[0].Domain != "one.cz" || got[1].Domain != "two.cz" {
 		t.Fatalf("unexpected domains: %v", got)
+	}
+}
+
+func TestCommonCrawlUsesSamePageSizeForCountAndPageFetch(t *testing.T) {
+	var countPageSize string
+	var fetchPageSize string
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/collinfo.json":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[{"id":"CC-MAIN-TEST","cdx-api":"` + server.URL + `/index"}]`))
+		case "/index":
+			if r.URL.Query().Get("showNumPages") == "true" {
+				countPageSize = r.URL.Query().Get("pageSize")
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"pages":1}`))
+				return
+			}
+			fetchPageSize = r.URL.Query().Get("pageSize")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"url":"https://example.cz/"}` + "\n"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	d := New(server.Client(), Config{Limit: 10, CollInfoURL: server.URL + "/collinfo.json"})
+	got, err := d.Discover(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %v", got)
+	}
+	want := strconv.Itoa(commonCrawlPageSize)
+	if countPageSize != want || fetchPageSize != want {
+		t.Fatalf("count pageSize=%q fetch pageSize=%q want %q", countPageSize, fetchPageSize, want)
 	}
 }
