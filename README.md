@@ -18,6 +18,13 @@ The default discovery source is Common Crawl:
 czdomains run --source commoncrawl --limit 1000
 ```
 
+When using `--cc-index latest`, `czdomains` scans Common Crawl indexes until it reaches `--limit` or runs out of available indexes. By default it scans every available Common Crawl index. Use `--cc-index-count N` to limit discovery to the newest `N` indexes for quicker test runs:
+
+```sh
+czdomains discover --limit 1000000 --out discovered.txt
+czdomains discover --limit 10000 --cc-index-count 3 --out quick-sample.txt
+```
+
 You can add `crt.sh`, but it is often rate-limited or temporarily unavailable:
 
 ```sh
@@ -31,10 +38,10 @@ czdomains run --source commoncrawl,crtsh --limit 1000
 `discovered.txt` stores one domain per line as:
 
 ```txt
-example.cz	commoncrawl
+example.cz
 ```
 
-Hand-written input files may contain just domains; the source will be recorded as `input`.
+Hand-written input files may contain just domains. Legacy `domain<TAB>source` files are also accepted by `enrich`.
 
 ## Releases
 

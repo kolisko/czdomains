@@ -60,12 +60,13 @@ func runDiscover(args []string) error {
 	outPath := flags.String("out", "discovered.txt", "output domain list path")
 	sources := flags.String("source", "commoncrawl", "comma-separated sources: commoncrawl,crtsh")
 	ccIndex := flags.String("cc-index", "latest", "Common Crawl index id, URL, or latest")
+	ccIndexCount := flags.Int("cc-index-count", 0, "number of recent Common Crawl indexes to scan when --cc-index=latest; 0 scans all")
 	timeout := flags.Duration("timeout", 60*time.Second, "HTTP timeout")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 
-	results, err := discoverDomains(context.Background(), *limit, *sources, *ccIndex, *timeout)
+	results, err := discoverDomains(context.Background(), *limit, *sources, *ccIndex, *ccIndexCount, *timeout)
 	if err != nil && len(results) == 0 {
 		return err
 	}
@@ -104,13 +105,14 @@ func runAll(args []string) error {
 	jsonlPath := flags.String("jsonl", "domains.jsonl", "JSONL output path")
 	sources := flags.String("source", "commoncrawl", "comma-separated sources: commoncrawl,crtsh")
 	ccIndex := flags.String("cc-index", "latest", "Common Crawl index id, URL, or latest")
+	ccIndexCount := flags.Int("cc-index-count", 0, "number of recent Common Crawl indexes to scan when --cc-index=latest; 0 scans all")
 	delay := flags.Duration("delay", 200*time.Millisecond, "delay between RDAP requests")
 	timeout := flags.Duration("timeout", 60*time.Second, "HTTP timeout")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 
-	results, err := discoverDomains(context.Background(), *limit, *sources, *ccIndex, *timeout)
+	results, err := discoverDomains(context.Background(), *limit, *sources, *ccIndex, *ccIndexCount, *timeout)
 	if err != nil && len(results) == 0 {
 		return err
 	}
@@ -127,13 +129,14 @@ func runAll(args []string) error {
 	return nil
 }
 
-func discoverDomains(ctx context.Context, limit int, sources string, ccIndex string, timeout time.Duration) ([]discovery.Result, error) {
+func discoverDomains(ctx context.Context, limit int, sources string, ccIndex string, ccIndexCount int, timeout time.Duration) ([]discovery.Result, error) {
 	client := &http.Client{Timeout: timeout}
 	discoverer := discovery.New(client, discovery.Config{
-		Limit:     limit,
-		Sources:   splitCSV(sources),
-		CCIndex:   ccIndex,
-		UserAgent: userAgent,
+		Limit:        limit,
+		Sources:      splitCSV(sources),
+		CCIndex:      ccIndex,
+		CCIndexCount: ccIndexCount,
+		UserAgent:    userAgent,
 		Progress: func(format string, args ...any) {
 			fmt.Fprintf(os.Stderr, format, args...)
 		},
@@ -190,7 +193,7 @@ func writeDiscovered(path string, results []discovery.Result) error {
 
 	writer := bufio.NewWriter(file)
 	for _, result := range results {
-		if _, err := fmt.Fprintf(writer, "%s\t%s\n", result.Domain, result.Source); err != nil {
+		if _, err := fmt.Fprintf(writer, "%s\n", result.Domain); err != nil {
 			return err
 		}
 	}
@@ -255,6 +258,7 @@ func usage() {
 
 Usage:
   czdomains discover --limit 10000 --out discovered.txt
+  czdomains discover --limit 1000000 --cc-index-count 0 --out discovered.txt
   czdomains enrich --input discovered.txt --csv domains.csv --jsonl domains.jsonl
   czdomains run --limit 10000 --csv domains.csv --jsonl domains.jsonl
 

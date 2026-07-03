@@ -19,8 +19,7 @@ const (
 	DefaultCollInfoURL = "https://index.commoncrawl.org/collinfo.json"
 	DefaultCRTShURL    = "https://crt.sh/"
 
-	commonCrawlMaxIndexes = 6
-	httpAttempts          = 3
+	httpAttempts = 3
 )
 
 type HTTPClient interface {
@@ -28,14 +27,15 @@ type HTTPClient interface {
 }
 
 type Config struct {
-	Limit       int
-	Sources     []string
-	CCIndex     string
-	CollInfoURL string
-	CRTShURL    string
-	UserAgent   string
-	Delay       time.Duration
-	Progress    func(format string, args ...any)
+	Limit        int
+	Sources      []string
+	CCIndex      string
+	CollInfoURL  string
+	CRTShURL     string
+	UserAgent    string
+	Delay        time.Duration
+	CCIndexCount int
+	Progress     func(format string, args ...any)
 }
 
 type Result struct {
@@ -117,7 +117,7 @@ func (d *Discoverer) discoverCommonCrawl(ctx context.Context) ([]Result, error) 
 	results := make([]Result, 0)
 	var errs []error
 	for _, indexURL := range indexURLs {
-		d.progress("commoncrawl: scanning %s\n", indexURL)
+		d.progress("commoncrawl: scanning %s (%d unique domains so far)\n", indexURL, len(results))
 		pageCount, err := d.commonCrawlPageCount(ctx, indexURL)
 		if err != nil {
 			d.progress("commoncrawl: page count failed for %s: %v\n", indexURL, err)
@@ -135,9 +135,7 @@ func (d *Discoverer) discoverCommonCrawl(ctx context.Context) ([]Result, error) 
 			if d.config.Limit > 0 && len(results) >= d.config.Limit {
 				return results, errors.Join(errs...)
 			}
-			if len(results) > beforeIndex {
-				return results, errors.Join(errs...)
-			}
+			d.progress("commoncrawl: index added %d unique domains\n", len(results)-beforeIndex)
 			continue
 		}
 
@@ -153,9 +151,7 @@ func (d *Discoverer) discoverCommonCrawl(ctx context.Context) ([]Result, error) 
 				return results, errors.Join(errs...)
 			}
 		}
-		if len(results) > beforeIndex {
-			return results, errors.Join(errs...)
-		}
+		d.progress("commoncrawl: index added %d unique domains\n", len(results)-beforeIndex)
 	}
 
 	return results, errors.Join(errs...)
@@ -293,11 +289,18 @@ func (d *Discoverer) commonCrawlIndexURLs(ctx context.Context) ([]string, error)
 	if err := json.NewDecoder(resp.Body).Decode(&indexes); err != nil {
 		return nil, err
 	}
-	indexURLs := make([]string, 0, commonCrawlMaxIndexes)
+	indexLimit := d.config.CCIndexCount
+	if indexLimit < 0 {
+		indexLimit = 0
+	}
+	if indexLimit == 0 {
+		indexLimit = len(indexes)
+	}
+	indexURLs := make([]string, 0, indexLimit)
 	for _, index := range indexes {
 		if index.CDXAPI != "" {
 			indexURLs = append(indexURLs, index.CDXAPI)
-			if len(indexURLs) >= commonCrawlMaxIndexes {
+			if len(indexURLs) >= indexLimit {
 				break
 			}
 		}
