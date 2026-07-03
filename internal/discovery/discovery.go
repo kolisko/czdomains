@@ -35,6 +35,7 @@ type Config struct {
 	UserAgent    string
 	Delay        time.Duration
 	CCIndexCount int
+	PageTracker  PageTracker
 	Progress     func(format string, args ...any)
 }
 
@@ -43,10 +44,37 @@ type Result struct {
 	Source string
 }
 
+type FoundDomain struct {
+	Domain   string
+	Source   string
+	IndexURL string
+	Page     int
+}
+
+type CrawlPage struct {
+	Source   string
+	IndexURL string
+	Page     int
+}
+
+type Sink interface {
+	AddDomain(ctx context.Context, domain FoundDomain) (bool, error)
+	Count(ctx context.Context) (int, error)
+}
+
+type PageTracker interface {
+	PageComplete(ctx context.Context, page CrawlPage) (bool, error)
+	MarkPageStarted(ctx context.Context, page CrawlPage) error
+	MarkPageCompleted(ctx context.Context, page CrawlPage) error
+	MarkPageFailed(ctx context.Context, page CrawlPage, err error) error
+}
+
 type Discoverer struct {
 	client HTTPClient
 	config Config
 }
+
+var errLimitReached = errors.New("discovery limit reached")
 
 func New(client HTTPClient, config Config) *Discoverer {
 	if client == nil {
@@ -68,38 +96,42 @@ func New(client HTTPClient, config Config) *Discoverer {
 }
 
 func (d *Discoverer) Discover(ctx context.Context) ([]Result, error) {
-	var all []Result
+	sink := newMemorySink()
+	err := d.DiscoverTo(ctx, sink)
+	return sink.Results(), err
+}
+
+func (d *Discoverer) DiscoverTo(ctx context.Context, sink Sink) error {
 	var errs []error
-	seen := make(map[string]struct{})
 
 	for _, source := range d.config.Sources {
+		if d.config.Limit > 0 {
+			count, err := sink.Count(ctx)
+			if err != nil {
+				errs = append(errs, err)
+				break
+			}
+			if count >= d.config.Limit {
+				break
+			}
+		}
+
 		source = strings.ToLower(strings.TrimSpace(source))
-		var results []Result
 		var err error
 		switch source {
 		case "commoncrawl", "cc":
-			results, err = d.discoverCommonCrawl(ctx)
+			err = d.discoverCommonCrawl(ctx, sink)
 		case "crtsh":
-			results, err = d.discoverCRTSh(ctx)
+			err = d.discoverCRTSh(ctx, sink)
 		default:
 			err = fmt.Errorf("unknown source %q", source)
-		}
-		for _, result := range results {
-			if _, ok := seen[result.Domain]; ok {
-				continue
-			}
-			seen[result.Domain] = struct{}{}
-			all = append(all, result)
-			if d.config.Limit > 0 && len(all) >= d.config.Limit {
-				return all, errors.Join(errs...)
-			}
 		}
 		if err != nil {
 			errs = append(errs, err)
 		}
 	}
 
-	return all, errors.Join(errs...)
+	return errors.Join(errs...)
 }
 
 type ccIndex struct {
@@ -107,17 +139,22 @@ type ccIndex struct {
 	CDXAPI string `json:"cdx-api"`
 }
 
-func (d *Discoverer) discoverCommonCrawl(ctx context.Context) ([]Result, error) {
+func (d *Discoverer) discoverCommonCrawl(ctx context.Context, sink Sink) error {
 	indexURLs, err := d.commonCrawlIndexURLs(ctx)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	seen := map[string]struct{}{}
-	results := make([]Result, 0)
+	total, err := sink.Count(ctx)
+	if err != nil {
+		return err
+	}
+	if d.config.Limit > 0 && total >= d.config.Limit {
+		return nil
+	}
 	var errs []error
 	for _, indexURL := range indexURLs {
-		d.progress("commoncrawl: scanning %s (%d unique domains so far)\n", indexURL, len(results))
+		d.progress("commoncrawl: scanning %s (%d unique domains so far)\n", indexURL, total)
 		pageCount, err := d.commonCrawlPageCount(ctx, indexURL)
 		if err != nil {
 			d.progress("commoncrawl: page count failed for %s: %v\n", indexURL, err)
@@ -125,36 +162,38 @@ func (d *Discoverer) discoverCommonCrawl(ctx context.Context) ([]Result, error) 
 			pageCount = 0
 		}
 
-		beforeIndex := len(results)
+		beforeIndex := total
 		if pageCount == 0 {
-			err := d.scanCommonCrawl(ctx, commonCrawlQuery(indexURL, -1, commonCrawlRawLimit(d.config.Limit)), seen, &results)
+			page := CrawlPage{Source: "commoncrawl", IndexURL: indexURL, Page: -1}
+			err := d.scanCommonCrawlPage(ctx, page, commonCrawlQuery(indexURL, -1, commonCrawlRawLimit(d.config.Limit)), sink, &total)
+			if errors.Is(err, errLimitReached) {
+				return errors.Join(errs...)
+			}
 			if err != nil {
 				d.progress("commoncrawl: scan failed for %s: %v\n", indexURL, err)
 				errs = append(errs, err)
 			}
-			if d.config.Limit > 0 && len(results) >= d.config.Limit {
-				return results, errors.Join(errs...)
-			}
-			d.progress("commoncrawl: index added %d unique domains\n", len(results)-beforeIndex)
+			d.progress("commoncrawl: index added %d unique domains\n", total-beforeIndex)
 			continue
 		}
 
 		for page := 0; page < pageCount; page++ {
-			err := d.scanCommonCrawl(ctx, commonCrawlQuery(indexURL, page, 0), seen, &results)
+			crawlPage := CrawlPage{Source: "commoncrawl", IndexURL: indexURL, Page: page}
+			err := d.scanCommonCrawlPage(ctx, crawlPage, commonCrawlQuery(indexURL, page, 0), sink, &total)
+			if errors.Is(err, errLimitReached) {
+				return errors.Join(errs...)
+			}
 			if err != nil {
 				d.progress("commoncrawl: page %d/%d failed for %s: %v\n", page+1, pageCount, indexURL, err)
 				errs = append(errs, err)
 				continue
 			}
-			d.progress("commoncrawl: page %d/%d, %d unique domains\n", page+1, pageCount, len(results))
-			if d.config.Limit > 0 && len(results) >= d.config.Limit {
-				return results, errors.Join(errs...)
-			}
+			d.progress("commoncrawl: page %d/%d, %d unique domains\n", page+1, pageCount, total)
 		}
-		d.progress("commoncrawl: index added %d unique domains\n", len(results)-beforeIndex)
+		d.progress("commoncrawl: index added %d unique domains\n", total-beforeIndex)
 	}
 
-	return results, errors.Join(errs...)
+	return errors.Join(errs...)
 }
 
 func commonCrawlQuery(indexURL string, page int, limit int) string {
@@ -213,12 +252,27 @@ func (d *Discoverer) commonCrawlPageCount(ctx context.Context, indexURL string) 
 	return 0, lastErr
 }
 
-func (d *Discoverer) scanCommonCrawl(ctx context.Context, rawURL string, seen map[string]struct{}, results *[]Result) error {
+func (d *Discoverer) scanCommonCrawlPage(ctx context.Context, page CrawlPage, rawURL string, sink Sink, total *int) error {
+	if d.config.PageTracker != nil {
+		complete, err := d.config.PageTracker.PageComplete(ctx, page)
+		if err != nil {
+			return err
+		}
+		if complete {
+			d.progress("commoncrawl: skipping completed page %d for %s\n", page.Page, page.IndexURL)
+			return nil
+		}
+		if err := d.config.PageTracker.MarkPageStarted(ctx, page); err != nil {
+			return err
+		}
+	}
+
 	var lastErr error
 	for attempt := 1; attempt <= httpAttempts; attempt++ {
 		resp, err := d.getOK(ctx, rawURL, "commoncrawl")
 		if err != nil {
-			return err
+			lastErr = err
+			break
 		}
 		scanner := bufio.NewScanner(resp.Body)
 		scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
@@ -233,18 +287,32 @@ func (d *Discoverer) scanCommonCrawl(ctx context.Context, rawURL string, seen ma
 			if err != nil {
 				continue
 			}
-			if _, ok := seen[domain]; ok {
-				continue
+			inserted, err := sink.AddDomain(ctx, FoundDomain{
+				Domain:   domain,
+				Source:   "commoncrawl",
+				IndexURL: page.IndexURL,
+				Page:     page.Page,
+			})
+			if err != nil {
+				_ = resp.Body.Close()
+				return err
 			}
-			seen[domain] = struct{}{}
-			*results = append(*results, Result{Domain: domain, Source: "commoncrawl"})
-			if d.config.Limit > 0 && len(*results) >= d.config.Limit {
-				break
+			if inserted {
+				(*total)++
+				if d.config.Limit > 0 && *total >= d.config.Limit {
+					_ = resp.Body.Close()
+					return errLimitReached
+				}
 			}
 		}
 		err = scanner.Err()
 		_ = resp.Body.Close()
 		if err == nil {
+			if d.config.PageTracker != nil {
+				if err := d.config.PageTracker.MarkPageCompleted(ctx, page); err != nil {
+					return err
+				}
+			}
 			return nil
 		}
 		lastErr = err
@@ -252,6 +320,11 @@ func (d *Discoverer) scanCommonCrawl(ctx context.Context, rawURL string, seen ma
 			if err := sleepBeforeRetry(ctx, attempt); err != nil {
 				return err
 			}
+		}
+	}
+	if d.config.PageTracker != nil && lastErr != nil {
+		if err := d.config.PageTracker.MarkPageFailed(ctx, page, lastErr); err != nil {
+			return err
 		}
 	}
 	return lastErr
@@ -311,10 +384,10 @@ func (d *Discoverer) commonCrawlIndexURLs(ctx context.Context) ([]string, error)
 	return indexURLs, nil
 }
 
-func (d *Discoverer) discoverCRTSh(ctx context.Context) ([]Result, error) {
+func (d *Discoverer) discoverCRTSh(ctx context.Context, sink Sink) error {
 	base, err := url.Parse(d.config.CRTShURL)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	values := base.Query()
 	values.Set("q", "%.cz")
@@ -323,23 +396,28 @@ func (d *Discoverer) discoverCRTSh(ctx context.Context) ([]Result, error) {
 
 	resp, err := d.getOK(ctx, base.String(), "crtsh")
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 128*1024*1024))
 	if err != nil {
-		return nil, err
+		return err
 	}
 	var rows []struct {
 		NameValue string `json:"name_value"`
 	}
 	if err := json.Unmarshal(body, &rows); err != nil {
-		return nil, err
+		return err
 	}
 
-	seen := map[string]struct{}{}
-	results := make([]Result, 0)
+	total, err := sink.Count(ctx)
+	if err != nil {
+		return err
+	}
+	if d.config.Limit > 0 && total >= d.config.Limit {
+		return nil
+	}
 	for _, row := range rows {
 		for _, name := range strings.Split(row.NameValue, "\n") {
 			name = strings.TrimPrefix(strings.TrimSpace(name), "*.")
@@ -347,17 +425,19 @@ func (d *Discoverer) discoverCRTSh(ctx context.Context) ([]Result, error) {
 			if err != nil {
 				continue
 			}
-			if _, ok := seen[domain]; ok {
-				continue
+			inserted, err := sink.AddDomain(ctx, FoundDomain{Domain: domain, Source: "crtsh", Page: -1})
+			if err != nil {
+				return err
 			}
-			seen[domain] = struct{}{}
-			results = append(results, Result{Domain: domain, Source: "crtsh"})
-			if d.config.Limit > 0 && len(results) >= d.config.Limit {
-				return results, nil
+			if inserted {
+				total++
+				if d.config.Limit > 0 && total >= d.config.Limit {
+					return nil
+				}
 			}
 		}
 	}
-	return results, nil
+	return nil
 }
 
 func (d *Discoverer) newRequest(ctx context.Context, rawURL string) (*http.Request, error) {

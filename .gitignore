@@ -8,6 +8,9 @@
 /discovered.txt
 /domains.csv
 /domains.jsonl
+/czdomains.sqlite
+/czdomains.sqlite-shm
+/czdomains.sqlite-wal
 
 # Local OS/editor files
 .DS_Store
