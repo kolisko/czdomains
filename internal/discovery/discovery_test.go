@@ -55,3 +55,39 @@ func TestCRTShDiscovery(t *testing.T) {
 		t.Fatalf("got %v", got)
 	}
 }
+
+func TestCommonCrawlKeepsPartialResultsWhenPageFails(t *testing.T) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/collinfo.json":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[{"id":"CC-MAIN-TEST","cdx-api":"` + server.URL + `/index"}]`))
+		case "/index":
+			if r.URL.Query().Get("showNumPages") == "true" {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"pages":2}`))
+				return
+			}
+			if r.URL.Query().Get("page") == "0" {
+				http.Error(w, "bad gateway", http.StatusBadGateway)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"url":"https://www.seznam.cz/"}` + "\n"))
+			_, _ = w.Write([]byte(`{"url":"https://mail.example.cz/path"}` + "\n"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	d := New(server.Client(), Config{Limit: 10, CollInfoURL: server.URL + "/collinfo.json"})
+	got, err := d.Discover(context.Background())
+	if err == nil {
+		t.Fatal("expected warning error from failed page")
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %v, err %v", got, err)
+	}
+}

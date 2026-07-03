@@ -18,6 +18,9 @@ import (
 const (
 	DefaultCollInfoURL = "https://index.commoncrawl.org/collinfo.json"
 	DefaultCRTShURL    = "https://crt.sh/"
+
+	commonCrawlMaxIndexes = 6
+	httpAttempts          = 3
 )
 
 type HTTPClient interface {
@@ -32,6 +35,7 @@ type Config struct {
 	CRTShURL    string
 	UserAgent   string
 	Delay       time.Duration
+	Progress    func(format string, args ...any)
 }
 
 type Result struct {
@@ -80,10 +84,6 @@ func (d *Discoverer) Discover(ctx context.Context) ([]Result, error) {
 		default:
 			err = fmt.Errorf("unknown source %q", source)
 		}
-		if err != nil {
-			errs = append(errs, err)
-			continue
-		}
 		for _, result := range results {
 			if _, ok := seen[result.Domain]; ok {
 				continue
@@ -93,6 +93,9 @@ func (d *Discoverer) Discover(ctx context.Context) ([]Result, error) {
 			if d.config.Limit > 0 && len(all) >= d.config.Limit {
 				return all, errors.Join(errs...)
 			}
+		}
+		if err != nil {
+			errs = append(errs, err)
 		}
 	}
 
@@ -105,35 +108,57 @@ type ccIndex struct {
 }
 
 func (d *Discoverer) discoverCommonCrawl(ctx context.Context) ([]Result, error) {
-	indexURL, err := d.commonCrawlIndexURL(ctx)
+	indexURLs, err := d.commonCrawlIndexURLs(ctx)
 	if err != nil {
 		return nil, err
-	}
-
-	pageCount, err := d.commonCrawlPageCount(ctx, indexURL)
-	if err != nil {
-		pageCount = 0
 	}
 
 	seen := map[string]struct{}{}
 	results := make([]Result, 0)
 	var errs []error
-	if pageCount > 0 {
-		for page := 0; page < pageCount; page++ {
-			err := d.scanCommonCrawl(ctx, commonCrawlQuery(indexURL, page, 0), seen, &results)
+	for _, indexURL := range indexURLs {
+		d.progress("commoncrawl: scanning %s\n", indexURL)
+		pageCount, err := d.commonCrawlPageCount(ctx, indexURL)
+		if err != nil {
+			d.progress("commoncrawl: page count failed for %s: %v\n", indexURL, err)
+			errs = append(errs, err)
+			pageCount = 0
+		}
+
+		beforeIndex := len(results)
+		if pageCount == 0 {
+			err := d.scanCommonCrawl(ctx, commonCrawlQuery(indexURL, -1, commonCrawlRawLimit(d.config.Limit)), seen, &results)
 			if err != nil {
+				d.progress("commoncrawl: scan failed for %s: %v\n", indexURL, err)
 				errs = append(errs, err)
-				continue
 			}
 			if d.config.Limit > 0 && len(results) >= d.config.Limit {
 				return results, errors.Join(errs...)
 			}
+			if len(results) > beforeIndex {
+				return results, errors.Join(errs...)
+			}
+			continue
 		}
-		return results, errors.Join(errs...)
+
+		for page := 0; page < pageCount; page++ {
+			err := d.scanCommonCrawl(ctx, commonCrawlQuery(indexURL, page, 0), seen, &results)
+			if err != nil {
+				d.progress("commoncrawl: page %d/%d failed for %s: %v\n", page+1, pageCount, indexURL, err)
+				errs = append(errs, err)
+				continue
+			}
+			d.progress("commoncrawl: page %d/%d, %d unique domains\n", page+1, pageCount, len(results))
+			if d.config.Limit > 0 && len(results) >= d.config.Limit {
+				return results, errors.Join(errs...)
+			}
+		}
+		if len(results) > beforeIndex {
+			return results, errors.Join(errs...)
+		}
 	}
 
-	err = d.scanCommonCrawl(ctx, commonCrawlQuery(indexURL, -1, commonCrawlRawLimit(d.config.Limit)), seen, &results)
-	return results, err
+	return results, errors.Join(errs...)
 }
 
 func commonCrawlQuery(indexURL string, page int, limit int) string {
@@ -170,66 +195,70 @@ func (d *Discoverer) commonCrawlPageCount(ctx context.Context, indexURL string) 
 	values.Set("pageSize", "1000")
 	query.RawQuery = values.Encode()
 
-	req, err := d.newRequest(ctx, query.String())
-	if err != nil {
-		return 0, err
+	var lastErr error
+	for attempt := 1; attempt <= httpAttempts; attempt++ {
+		resp, err := d.getOK(ctx, query.String(), "commoncrawl page count")
+		if err != nil {
+			return 0, err
+		}
+		var info ccPageInfo
+		err = json.NewDecoder(resp.Body).Decode(&info)
+		_ = resp.Body.Close()
+		if err == nil {
+			return info.Pages, nil
+		}
+		lastErr = err
+		if attempt < httpAttempts {
+			if err := sleepBeforeRetry(ctx, attempt); err != nil {
+				return 0, err
+			}
+		}
 	}
-	resp, err := d.client.Do(req)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return 0, fmt.Errorf("commoncrawl page count returned HTTP %d", resp.StatusCode)
-	}
-
-	var info ccPageInfo
-	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
-		return 0, err
-	}
-	return info.Pages, nil
+	return 0, lastErr
 }
 
 func (d *Discoverer) scanCommonCrawl(ctx context.Context, rawURL string, seen map[string]struct{}, results *[]Result) error {
-	req, err := d.newRequest(ctx, rawURL)
-	if err != nil {
-		return err
-	}
-	resp, err := d.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return fmt.Errorf("commoncrawl returned HTTP %d", resp.StatusCode)
-	}
-
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
-	for scanner.Scan() {
-		var row struct {
-			URL string `json:"url"`
-		}
-		if err := json.Unmarshal(scanner.Bytes(), &row); err != nil || row.URL == "" {
-			continue
-		}
-		domain, err := domainutil.FromURL(row.URL)
+	var lastErr error
+	for attempt := 1; attempt <= httpAttempts; attempt++ {
+		resp, err := d.getOK(ctx, rawURL, "commoncrawl")
 		if err != nil {
-			continue
+			return err
 		}
-		if _, ok := seen[domain]; ok {
-			continue
+		scanner := bufio.NewScanner(resp.Body)
+		scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
+		for scanner.Scan() {
+			var row struct {
+				URL string `json:"url"`
+			}
+			if err := json.Unmarshal(scanner.Bytes(), &row); err != nil || row.URL == "" {
+				continue
+			}
+			domain, err := domainutil.FromURL(row.URL)
+			if err != nil {
+				continue
+			}
+			if _, ok := seen[domain]; ok {
+				continue
+			}
+			seen[domain] = struct{}{}
+			*results = append(*results, Result{Domain: domain, Source: "commoncrawl"})
+			if d.config.Limit > 0 && len(*results) >= d.config.Limit {
+				break
+			}
 		}
-		seen[domain] = struct{}{}
-		*results = append(*results, Result{Domain: domain, Source: "commoncrawl"})
-		if d.config.Limit > 0 && len(*results) >= d.config.Limit {
-			break
+		err = scanner.Err()
+		_ = resp.Body.Close()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if attempt < httpAttempts {
+			if err := sleepBeforeRetry(ctx, attempt); err != nil {
+				return err
+			}
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		return err
-	}
-	return nil
+	return lastErr
 }
 
 func commonCrawlRawLimit(uniqueLimit int) int {
@@ -246,37 +275,37 @@ func commonCrawlRawLimit(uniqueLimit int) int {
 	return rawLimit
 }
 
-func (d *Discoverer) commonCrawlIndexURL(ctx context.Context) (string, error) {
+func (d *Discoverer) commonCrawlIndexURLs(ctx context.Context) ([]string, error) {
 	if d.config.CCIndex != "" && d.config.CCIndex != "latest" {
 		if strings.HasPrefix(d.config.CCIndex, "http://") || strings.HasPrefix(d.config.CCIndex, "https://") {
-			return d.config.CCIndex, nil
+			return []string{d.config.CCIndex}, nil
 		}
-		return fmt.Sprintf("https://index.commoncrawl.org/%s-index", d.config.CCIndex), nil
+		return []string{fmt.Sprintf("https://index.commoncrawl.org/%s-index", d.config.CCIndex)}, nil
 	}
 
-	req, err := d.newRequest(ctx, d.config.CollInfoURL)
+	resp, err := d.getOK(ctx, d.config.CollInfoURL, "commoncrawl collinfo")
 	if err != nil {
-		return "", err
-	}
-	resp, err := d.client.Do(req)
-	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return "", fmt.Errorf("commoncrawl collinfo returned HTTP %d", resp.StatusCode)
-	}
 
 	var indexes []ccIndex
 	if err := json.NewDecoder(resp.Body).Decode(&indexes); err != nil {
-		return "", err
+		return nil, err
 	}
+	indexURLs := make([]string, 0, commonCrawlMaxIndexes)
 	for _, index := range indexes {
 		if index.CDXAPI != "" {
-			return index.CDXAPI, nil
+			indexURLs = append(indexURLs, index.CDXAPI)
+			if len(indexURLs) >= commonCrawlMaxIndexes {
+				break
+			}
 		}
 	}
-	return "", errors.New("commoncrawl collinfo did not contain a cdx-api endpoint")
+	if len(indexURLs) == 0 {
+		return nil, errors.New("commoncrawl collinfo did not contain a cdx-api endpoint")
+	}
+	return indexURLs, nil
 }
 
 func (d *Discoverer) discoverCRTSh(ctx context.Context) ([]Result, error) {
@@ -289,18 +318,11 @@ func (d *Discoverer) discoverCRTSh(ctx context.Context) ([]Result, error) {
 	values.Set("output", "json")
 	base.RawQuery = values.Encode()
 
-	req, err := d.newRequest(ctx, base.String())
-	if err != nil {
-		return nil, err
-	}
-	resp, err := d.client.Do(req)
+	resp, err := d.getOK(ctx, base.String(), "crtsh")
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, fmt.Errorf("crtsh returned HTTP %d", resp.StatusCode)
-	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 128*1024*1024))
 	if err != nil {
@@ -343,4 +365,56 @@ func (d *Discoverer) newRequest(ctx context.Context, rawURL string) (*http.Reque
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", d.config.UserAgent)
 	return req, nil
+}
+
+func (d *Discoverer) getOK(ctx context.Context, rawURL string, label string) (*http.Response, error) {
+	var lastErr error
+	for attempt := 1; attempt <= httpAttempts; attempt++ {
+		req, err := d.newRequest(ctx, rawURL)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := d.client.Do(req)
+		if err == nil && resp.StatusCode >= 200 && resp.StatusCode <= 299 {
+			return resp, nil
+		}
+		if err != nil {
+			lastErr = err
+		} else {
+			lastErr = fmt.Errorf("%s returned HTTP %d", label, resp.StatusCode)
+			if resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+			if !isRetriableStatus(resp.StatusCode) {
+				return nil, lastErr
+			}
+		}
+		if attempt < httpAttempts {
+			if err := sleepBeforeRetry(ctx, attempt); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return nil, lastErr
+}
+
+func isRetriableStatus(status int) bool {
+	return status == http.StatusTooManyRequests || status >= 500
+}
+
+func sleepBeforeRetry(ctx context.Context, attempt int) error {
+	timer := time.NewTimer(time.Duration(attempt) * 300 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (d *Discoverer) progress(format string, args ...any) {
+	if d.config.Progress != nil {
+		d.config.Progress(format, args...)
+	}
 }

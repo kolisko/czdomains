@@ -134,6 +134,9 @@ func discoverDomains(ctx context.Context, limit int, sources string, ccIndex str
 		Sources:   splitCSV(sources),
 		CCIndex:   ccIndex,
 		UserAgent: userAgent,
+		Progress: func(format string, args ...any) {
+			fmt.Fprintf(os.Stderr, format, args...)
+		},
 	})
 	return discoverer.Discover(ctx)
 }
