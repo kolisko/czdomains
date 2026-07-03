@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -121,7 +122,7 @@ func runEnrich(args []string) error {
 func runExport(args []string) error {
 	flags := flag.NewFlagSet("export", flag.ContinueOnError)
 	dbPath := flags.String("db", "czdomains.sqlite", "SQLite discovery database path")
-	outPath := flags.String("out", "discovered.txt", "TXT output path")
+	outPath := flags.String("out", "", "TXT output path; defaults to stdout")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -130,7 +131,13 @@ func runExport(args []string) error {
 		return err
 	}
 	defer store.Close()
-	count, err := exportDomains(context.Background(), store, *outPath)
+
+	if *outPath == "" {
+		_, err := exportDomains(context.Background(), store, os.Stdout)
+		return err
+	}
+
+	count, err := exportDomainsToFile(context.Background(), store, *outPath)
 	if err != nil {
 		return err
 	}
@@ -284,15 +291,19 @@ func enrichEach(ctx context.Context, each func(func(domainInput) error) error, t
 	return nil
 }
 
-func exportDomains(ctx context.Context, store *storage.Store, outPath string) (int, error) {
+func exportDomainsToFile(ctx context.Context, store *storage.Store, outPath string) (int, error) {
 	file, err := os.Create(outPath)
 	if err != nil {
 		return 0, err
 	}
 	defer file.Close()
-	writer := bufio.NewWriter(file)
+	return exportDomains(ctx, store, file)
+}
+
+func exportDomains(ctx context.Context, store *storage.Store, out io.Writer) (int, error) {
+	writer := bufio.NewWriter(out)
 	count := 0
-	err = store.ForEachDomain(ctx, func(domain string) error {
+	err := store.ForEachDomain(ctx, func(domain string) error {
 		if _, err := fmt.Fprintln(writer, domain); err != nil {
 			return err
 		}
@@ -383,6 +394,7 @@ func usage() {
 Usage:
   czdomains discover --limit 10000 --db czdomains.sqlite
   czdomains discover --limit 1000000 --db czdomains.sqlite --out discovered.txt
+  czdomains export --db czdomains.sqlite
   czdomains export --db czdomains.sqlite --out discovered.txt
   czdomains enrich --db czdomains.sqlite --csv domains.csv --jsonl domains.jsonl
   czdomains enrich --input discovered.txt --csv domains.csv --jsonl domains.jsonl
@@ -392,6 +404,10 @@ Discovery:
   --db       SQLite database for dedupe, checkpoints, and resume
   --out      Optional TXT stream of newly inserted domains only
   --fresh    Delete the old database first and truncate --out if set
+
+Export:
+  Without --out, export writes domains to stdout.
+  With --out, export writes domains to the given TXT file.
 
 Sources:
   commoncrawl  Common Crawl CDX index, default

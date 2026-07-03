@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -46,7 +47,7 @@ func TestExportDomainsWritesOnlyDomains(t *testing.T) {
 	}
 
 	path := filepath.Join(dir, "discovered.txt")
-	count, err := exportDomains(ctx, store, path)
+	count, err := exportDomainsToFile(ctx, store, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,5 +57,31 @@ func TestExportDomainsWritesOnlyDomains(t *testing.T) {
 	}
 	if count != 2 || string(got) != "example.cz\nseznam.cz\n" {
 		t.Fatalf("count=%d output=%q", count, string(got))
+	}
+}
+
+func TestExportDomainsWritesToWriter(t *testing.T) {
+	dir := t.TempDir()
+	store, err := storage.Open(filepath.Join(dir, "domains.sqlite"), storage.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	for _, domain := range []string{"seznam.cz", "example.cz"} {
+		_, err := store.AddDomain(ctx, discovery.FoundDomain{Domain: domain, Source: "test", Page: -1})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var out bytes.Buffer
+	count, err := exportDomains(ctx, store, &out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 || out.String() != "example.cz\nseznam.cz\n" {
+		t.Fatalf("count=%d output=%q", count, out.String())
 	}
 }

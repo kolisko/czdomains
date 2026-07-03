@@ -8,7 +8,7 @@ It does not bypass hidden or private registry data. If CZ.NIC RDAP does not publ
 
 ```sh
 czdomains discover --limit 10000 --db czdomains.sqlite
-czdomains export --db czdomains.sqlite --out discovered.txt
+czdomains export --db czdomains.sqlite
 czdomains enrich --db czdomains.sqlite --csv domains.csv --jsonl domains.jsonl
 czdomains run --limit 10000 --db czdomains.sqlite --csv domains.csv --jsonl domains.jsonl
 ```
@@ -46,7 +46,13 @@ If you want a plain text domain list during discovery, add `--out`. It writes on
 czdomains discover --limit 1000000 --db czdomains.sqlite --out discovered.txt
 ```
 
-For a complete text export from the SQLite database, use:
+For a complete text export from the SQLite database, use `export`. Without `--out`, it writes domains to stdout:
+
+```sh
+czdomains export --db czdomains.sqlite
+```
+
+Write the export to a file with `--out`:
 
 ```sh
 czdomains export --db czdomains.sqlite --out discovered.txt
