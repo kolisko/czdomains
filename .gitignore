@@ -1,0 +1,15 @@
+# Local build outputs
+/dist/
+/bin/
+/czdomains
+/czdomains.exe
+
+# Generated data exports
+/discovered.txt
+/domains.csv
+/domains.jsonl
+
+# Local OS/editor files
+.DS_Store
+.idea/
+.vscode/
