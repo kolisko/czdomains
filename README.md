@@ -11,7 +11,17 @@ czdomains discover --limit 10000 --db czdomains.sqlite
 czdomains export --db czdomains.sqlite
 czdomains enrich --db czdomains.sqlite --csv domains.csv --jsonl domains.jsonl
 czdomains run --limit 10000 --db czdomains.sqlite --csv domains.csv --jsonl domains.jsonl
+czdomains version
+czdomains update
 ```
+
+Release binaries check the latest GitHub Release before running discovery, export, enrich, or run commands. If the binary is outdated, it prints a prominent warning and stops before doing work. Update it explicitly with:
+
+```sh
+czdomains update
+```
+
+The update command downloads the matching release asset for your OS/architecture, verifies the GitHub asset digest when available, replaces the current binary, and cleans up its temporary download file.
 
 `discover` stores domains in SQLite by default. This keeps memory usage bounded, deduplicates domains across all sources and Common Crawl indexes, and allows the next run to resume from already completed pages.
 
@@ -101,3 +111,5 @@ GitHub Actions builds binaries for:
 - Windows amd64/arm64
 
 Push a tag like `v0.1.0` to create a GitHub Release with all binaries attached.
+
+Release builds embed the version from the git tag at build time. The source tree keeps `version=dev`, so the binary version cannot drift from the GitHub release tag.

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -17,10 +18,17 @@ import (
 	"czdomains/internal/enrich"
 	"czdomains/internal/output"
 	"czdomains/internal/rdap"
+	"czdomains/internal/selfupdate"
 	"czdomains/internal/storage"
 )
 
 const userAgent = "czdomains/1.0 (+https://github.com/)"
+
+var (
+	version   = "dev"
+	commit    = "unknown"
+	buildDate = "unknown"
+)
 
 type domainInput struct {
 	Domain string
@@ -34,8 +42,13 @@ type ccRetryOptions struct {
 	maxCooldowns  int
 }
 
+var errSilentExit = errors.New("silent exit")
+
 func main() {
 	if err := run(os.Args); err != nil {
+		if errors.Is(err, errSilentExit) {
+			os.Exit(1)
+		}
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
@@ -47,7 +60,24 @@ func run(args []string) error {
 		return errors.New("missing command")
 	}
 
-	switch args[1] {
+	command := args[1]
+	switch command {
+	case "help", "-h", "--help":
+		usage()
+		return nil
+	case "version":
+		return runVersion(args[2:])
+	case "update":
+		return runUpdate(args[2:])
+	}
+
+	if requiresLatestCheck(command) {
+		if err := ensureLatestVersion(context.Background(), args[0]); err != nil {
+			return err
+		}
+	}
+
+	switch command {
 	case "discover":
 		return runDiscover(args[2:])
 	case "enrich":
@@ -56,13 +86,27 @@ func run(args []string) error {
 		return runExport(args[2:])
 	case "run":
 		return runAll(args[2:])
-	case "help", "-h", "--help":
-		usage()
-		return nil
 	default:
 		usage()
-		return fmt.Errorf("unknown command %q", args[1])
+		return fmt.Errorf("unknown command %q", command)
 	}
+}
+
+func runVersion(args []string) error {
+	flags := flag.NewFlagSet("version", flag.ContinueOnError)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stdout, "czdomains %s\ncommit %s\nbuilt %s\n", version, commit, buildDate)
+	return nil
+}
+
+func runUpdate(args []string) error {
+	flags := flag.NewFlagSet("update", flag.ContinueOnError)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	return selfupdate.Update(context.Background(), selfUpdateConfig(), os.Stderr)
 }
 
 func runDiscover(args []string) error {
@@ -256,6 +300,52 @@ func addCommonCrawlRetryFlags(flags *flag.FlagSet) *ccRetryOptions {
 	return opts
 }
 
+func requiresLatestCheck(command string) bool {
+	switch command {
+	case "discover", "enrich", "export", "run":
+		return true
+	default:
+		return false
+	}
+}
+
+func ensureLatestVersion(ctx context.Context, executableName string) error {
+	if !selfupdate.IsReleaseVersion(version) {
+		return nil
+	}
+	result, err := selfupdate.Check(ctx, selfUpdateConfig())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not check latest czdomains release: %v\n", err)
+		return nil
+	}
+	if !result.Outdated {
+		return nil
+	}
+	binary := filepath.Base(executableName)
+	fmt.Fprintf(os.Stderr, `
+WARNING: OUTDATED CZDOMAINS BINARY
+
+CURRENT VERSION: %s
+LATEST VERSION:  %s
+
+THIS VERSION WILL NOT RUN. UPDATE FIRST:
+
+  %s update
+
+LATEST RELEASE:
+%s
+
+`, result.CurrentVersion, result.LatestVersion, binary, result.LatestURL)
+	return errSilentExit
+}
+
+func selfUpdateConfig() selfupdate.Config {
+	return selfupdate.Config{
+		CurrentVersion: version,
+		Client:         &http.Client{Timeout: 60 * time.Second},
+	}
+}
+
 func enrichDomains(ctx context.Context, inputs []domainInput, csvPath string, jsonlPath string, delay time.Duration, timeout time.Duration) error {
 	return enrichEach(ctx, func(yield func(domainInput) error) error {
 		for _, input := range inputs {
@@ -421,6 +511,8 @@ Usage:
   czdomains enrich --db czdomains.sqlite --csv domains.csv --jsonl domains.jsonl
   czdomains enrich --input discovered.txt --csv domains.csv --jsonl domains.jsonl
   czdomains run --limit 10000 --db czdomains.sqlite --csv domains.csv --jsonl domains.jsonl
+  czdomains version
+  czdomains update
 
 Discovery:
   --db       SQLite database for dedupe, checkpoints, and resume
@@ -438,5 +530,9 @@ Export:
 Sources:
   commoncrawl  Common Crawl CDX index, default
   crtsh        crt.sh certificate search, optional and often rate-limited
+
+Updates:
+  Release binaries stop before work when a newer GitHub Release exists.
+  Run "czdomains update" to download and replace the current binary.
 `)
 }
