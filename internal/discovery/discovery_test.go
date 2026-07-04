@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"path"
 	"strconv"
 	"strings"
 	"testing"
@@ -35,7 +36,7 @@ func TestCommonCrawlDiscoveryUsesClusterRangeScan(t *testing.T) {
 		case "/crawl-data/CC-MAIN-2026-25/cc-index.paths.gz":
 			_, _ = w.Write(manifest)
 		case "/cc-index/collections/CC-MAIN-2026-25/indexes/cluster.idx":
-			_, _ = fmt.Fprintf(w, "cz,example)/ 20260601000000 %s 0 %d 1\nda,example)/ 20260601000000 %s %d 10 2\n", cdxPath, len(cdxBlock), cdxPath, len(cdxBlock))
+			_, _ = fmt.Fprintf(w, "cz,example)/ 20260601000000 %s 0 %d 1\nda,example)/ 20260601000000 %s %d 10 2\n", path.Base(cdxPath), len(cdxBlock), path.Base(cdxPath), len(cdxBlock))
 		case "/" + cdxPath:
 			gotRange = r.Header.Get("Range")
 			if gotRange == "" {
@@ -165,6 +166,28 @@ func TestCommonCrawlDoesNotSequentialFallbackAfterClusterFailure(t *testing.T) {
 	}
 	if cdxRequests != 0 {
 		t.Fatalf("sequential CDX fallback made %d request(s)", cdxRequests)
+	}
+}
+
+func TestResolveClusterBlockPathsUsesManifestCDXPath(t *testing.T) {
+	blocks := []ccClusterBlock{{IndexPath: "cdx-00153.gz", Offset: 7, Length: 11}}
+	manifestPaths := []string{
+		"cc-index/collections/CC-MAIN-2026-25/indexes/cdx-00152.gz",
+		"cc-index/collections/CC-MAIN-2026-25/indexes/cdx-00153.gz",
+	}
+	if err := resolveClusterBlockPaths(blocks, manifestPaths); err != nil {
+		t.Fatal(err)
+	}
+	if blocks[0].IndexPath != manifestPaths[1] {
+		t.Fatalf("IndexPath=%q, want %q", blocks[0].IndexPath, manifestPaths[1])
+	}
+}
+
+func TestResolveClusterBlockPathsFailsForUnknownCDXName(t *testing.T) {
+	blocks := []ccClusterBlock{{IndexPath: "cdx-99999.gz", Offset: 7, Length: 11}}
+	err := resolveClusterBlockPaths(blocks, []string{"cc-index/collections/CC-MAIN-2026-25/indexes/cdx-00153.gz"})
+	if err == nil || !strings.Contains(err.Error(), "manifest did not contain a matching CDX path") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

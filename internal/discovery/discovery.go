@@ -426,6 +426,9 @@ func (d *Discoverer) scanCommonCrawlWithCluster(ctx context.Context, crawl ccCra
 	if len(blocks) == 0 {
 		return errors.New("commoncrawl: cluster.idx did not contain cz blocks")
 	}
+	if err := resolveClusterBlockPaths(blocks, manifest.CDXPaths); err != nil {
+		return err
+	}
 	d.progress("commoncrawl: cluster selected %d CZ candidate block(s)\n", len(blocks))
 	before := *total
 	for i, block := range blocks {
@@ -437,6 +440,24 @@ func (d *Discoverer) scanCommonCrawlWithCluster(ctx context.Context, crawl ccCra
 		if err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func resolveClusterBlockPaths(blocks []ccClusterBlock, manifestPaths []string) error {
+	byName := make(map[string]string, len(manifestPaths))
+	for _, manifestPath := range manifestPaths {
+		byName[path.Base(manifestPath)] = manifestPath
+	}
+	for i := range blocks {
+		if strings.Contains(blocks[i].IndexPath, "/") {
+			continue
+		}
+		resolved, ok := byName[blocks[i].IndexPath]
+		if !ok {
+			return fmt.Errorf("commoncrawl: cluster.idx referenced %q but manifest did not contain a matching CDX path", blocks[i].IndexPath)
+		}
+		blocks[i].IndexPath = resolved
 	}
 	return nil
 }
