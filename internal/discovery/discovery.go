@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -51,6 +52,7 @@ type Config struct {
 	CollInfoURL      string
 	CCCollectionsURL string
 	CCDataBaseURL    string
+	CCIndexCacheDir  string
 	CRTShURL         string
 	UserAgent        string
 	Delay            time.Duration
@@ -405,22 +407,24 @@ func parseCommonCrawlManifest(r io.Reader) (ccManifest, error) {
 
 func (d *Discoverer) scanCommonCrawlWithCluster(ctx context.Context, crawl ccCrawl, manifest ccManifest, sink Sink, total *int) error {
 	clusterURL := d.commonCrawlDataURL(manifest.ClusterPath)
-	d.progress("commoncrawl: downloading cluster map %s\n", clusterURL)
-	clusterFile, err := d.downloadCommonCrawlObjectToTemp(ctx, clusterURL, fmt.Sprintf("cluster.idx %s", crawl.ID))
-	if err != nil {
-		return err
-	}
-	defer func() {
-		name := clusterFile.Name()
-		_ = clusterFile.Close()
-		_ = os.Remove(name)
-	}()
-	if _, err := clusterFile.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-
-	blocks, err := parseCommonCrawlCluster(clusterFile)
-	if err != nil {
+	d.progress("commoncrawl: preparing cluster map %s\n", clusterURL)
+	var blocks []ccClusterBlock
+	for attempt := 0; attempt < 2; attempt++ {
+		clusterFile, cached, cleanup, err := d.openCommonCrawlCluster(ctx, crawl, manifest, clusterURL)
+		if err != nil {
+			return err
+		}
+		blocks, err = parseCommonCrawlCluster(clusterFile)
+		cleanup()
+		if err == nil {
+			break
+		}
+		if cached {
+			cachePath := d.commonCrawlClusterCachePath(crawl, manifest)
+			d.progress("commoncrawl: cached cluster map is invalid, deleting %s: %v\n", cachePath, err)
+			_ = os.Remove(cachePath)
+			continue
+		}
 		return err
 	}
 	if len(blocks) == 0 {
@@ -432,16 +436,107 @@ func (d *Discoverer) scanCommonCrawlWithCluster(ctx context.Context, crawl ccCra
 	d.progress("commoncrawl: cluster selected %d CZ candidate block(s)\n", len(blocks))
 	before := *total
 	for i, block := range blocks {
-		d.progress("commoncrawl: block %d/%d %s offset=%d length=%d (%d new, %d total)\n", i+1, len(blocks), path.Base(block.IndexPath), block.Offset, block.Length, *total-before, *total)
+		blockBefore := *total
 		err := d.scanCommonCrawlRangeBlock(ctx, crawl, block, sink, total)
 		if errors.Is(err, errLimitReached) {
+			d.progress("commoncrawl: block %d/%d %s offset=%d length=%d done (block-new=%d crawl-new=%d db-total=%d)\n", i+1, len(blocks), path.Base(block.IndexPath), block.Offset, block.Length, *total-blockBefore, *total-before, *total)
 			return err
 		}
 		if err != nil {
 			return err
 		}
+		d.progress("commoncrawl: block %d/%d %s offset=%d length=%d done (block-new=%d crawl-new=%d db-total=%d)\n", i+1, len(blocks), path.Base(block.IndexPath), block.Offset, block.Length, *total-blockBefore, *total-before, *total)
 	}
 	return nil
+}
+
+func (d *Discoverer) openCommonCrawlCluster(ctx context.Context, crawl ccCrawl, manifest ccManifest, clusterURL string) (*os.File, bool, func(), error) {
+	cachePath := d.commonCrawlClusterCachePath(crawl, manifest)
+	if cachePath != "" {
+		if stat, err := os.Stat(cachePath); err == nil && stat.Size() > 0 {
+			d.progress("commoncrawl: using cached cluster map %s (%s)\n", cachePath, formatBytes(stat.Size()))
+			file, err := os.Open(cachePath)
+			if err != nil {
+				return nil, false, nil, err
+			}
+			return file, true, func() { _ = file.Close() }, nil
+		}
+		if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
+			return nil, false, nil, err
+		}
+	}
+
+	clusterFile, err := d.downloadCommonCrawlObjectToTemp(ctx, clusterURL, fmt.Sprintf("cluster.idx %s", crawl.ID))
+	if err != nil {
+		return nil, false, nil, err
+	}
+	if _, err := clusterFile.Seek(0, io.SeekStart); err != nil {
+		name := clusterFile.Name()
+		_ = clusterFile.Close()
+		_ = os.Remove(name)
+		return nil, false, nil, err
+	}
+	if cachePath == "" {
+		return clusterFile, false, func() {
+			name := clusterFile.Name()
+			_ = clusterFile.Close()
+			_ = os.Remove(name)
+		}, nil
+	}
+
+	tempName := clusterFile.Name()
+	_ = clusterFile.Close()
+	cacheTmp := fmt.Sprintf("%s.%d.tmp", cachePath, os.Getpid())
+	_ = os.Remove(cacheTmp)
+	if err := moveFile(tempName, cacheTmp); err != nil {
+		_ = os.Remove(tempName)
+		_ = os.Remove(cacheTmp)
+		return nil, false, nil, err
+	}
+	if err := os.Rename(cacheTmp, cachePath); err != nil {
+		_ = os.Remove(cacheTmp)
+		return nil, false, nil, err
+	}
+	if stat, err := os.Stat(cachePath); err == nil {
+		d.progress("commoncrawl: cached cluster map %s (%s)\n", cachePath, formatBytes(stat.Size()))
+	}
+	file, err := os.Open(cachePath)
+	if err != nil {
+		return nil, false, nil, err
+	}
+	return file, false, func() { _ = file.Close() }, nil
+}
+
+func (d *Discoverer) commonCrawlClusterCachePath(crawl ccCrawl, manifest ccManifest) string {
+	cacheDir := strings.TrimSpace(d.config.CCIndexCacheDir)
+	if cacheDir == "" {
+		return ""
+	}
+	return filepath.Join(cacheDir, "commoncrawl", crawl.ID, path.Base(manifest.ClusterPath))
+}
+
+func moveFile(src string, dst string) error {
+	if err := os.Rename(src, dst); err == nil {
+		return nil
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(out, in)
+	closeErr := out.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	return os.Remove(src)
 }
 
 func resolveClusterBlockPaths(blocks []ccClusterBlock, manifestPaths []string) error {
@@ -716,7 +811,8 @@ func (d *Discoverer) scanCommonCrawlSequential(ctx context.Context, crawl ccCraw
 			}
 		}
 
-		d.progress("commoncrawl: file %d/%d %s (%d new, %d total)\n", i+1, len(cdxPaths), path.Base(cdxPath), *total-before, *total)
+		fileBefore := *total
+		d.progress("commoncrawl: file %d/%d %s starting (crawl-new=%d db-total=%d)\n", i+1, len(cdxPaths), path.Base(cdxPath), *total-before, *total)
 		resp, err := d.getOKWithCooldown(ctx, d.commonCrawlDataURL(cdxPath), "commoncrawl cdx", path.Base(cdxPath))
 		if err != nil {
 			if d.config.BlockTracker != nil {
@@ -740,6 +836,7 @@ func (d *Discoverer) scanCommonCrawlSequential(ctx context.Context, crawl ccCraw
 		if hitCZ {
 			seenCZ = true
 		}
+		d.progress("commoncrawl: file %d/%d %s done (file-new=%d crawl-new=%d db-total=%d)\n", i+1, len(cdxPaths), path.Base(cdxPath), *total-fileBefore, *total-before, *total)
 		if seenCZ && passedCZ {
 			d.progress("commoncrawl: sequential scan passed cz, prefix; stopping after %s\n", path.Base(cdxPath))
 			return nil

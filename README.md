@@ -21,7 +21,7 @@ Release binaries check the latest GitHub Release before running discovery, expor
 czdomains update
 ```
 
-The update command downloads the matching release asset for your OS/architecture, verifies the GitHub asset digest when available, replaces the current binary, and cleans up its temporary download file.
+The update command downloads the matching release asset for your OS/architecture, shows download progress, verifies the GitHub asset digest when available, replaces the current binary, and cleans up its temporary download file.
 
 `discover` stores domains in SQLite by default. This keeps memory usage bounded, deduplicates domains across all sources and Common Crawl data indexes, and allows the next run to resume from already completed index blocks.
 
@@ -32,6 +32,8 @@ czdomains discover --fresh --limit 10000 --db czdomains.sqlite
 ```
 
 The default discovery source is Common Crawl. `czdomains` reads Common Crawl data files from `data.commoncrawl.org`: it resolves a crawl, downloads `cc-index.paths.gz`, and uses `cluster.idx` when available to fetch only relevant `cdx-*.gz` byte ranges. Sequential CDX streaming is used only for crawls whose manifest does not contain `cluster.idx`; if a present cluster map fails, discovery stops instead of downloading every CDX file.
+
+Downloaded Common Crawl index maps are cached next to the SQLite database in `.czdomains-cache`. `--fresh` deletes the SQLite database but keeps this cache, so rerunning the same crawl can reuse an already downloaded `cluster.idx`.
 
 ```sh
 czdomains discover --source commoncrawl --limit 1000

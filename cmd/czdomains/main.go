@@ -257,12 +257,14 @@ func discoverToSQLite(ctx context.Context, dbPath string, outPath string, fresh 
 	defer sink.Close()
 
 	client := discoveryHTTPClient(timeout)
-	fmt.Fprintf(os.Stderr, "discovery: db=%s limit=%d sources=%s cc-index=%s cc-index-count=%d\n", dbPath, limit, sources, ccIndex, ccIndexCount)
+	cacheDir := commonCrawlCacheDir(dbPath)
+	fmt.Fprintf(os.Stderr, "discovery: db=%s limit=%d sources=%s cc-index=%s cc-index-count=%d cache=%s\n", dbPath, limit, sources, ccIndex, ccIndexCount, cacheDir)
 	discoverer := discovery.New(client, discovery.Config{
 		Limit:           limit,
 		Sources:         splitCSV(sources),
 		CCIndex:         ccIndex,
 		CCIndexCount:    ccIndexCount,
+		CCIndexCacheDir: cacheDir,
 		UserAgent:       userAgent,
 		BlockTracker:    store,
 		CCFailThreshold: ccRetry.failThreshold,
@@ -297,6 +299,14 @@ func discoverDomains(ctx context.Context, limit int, sources string, ccIndex str
 		},
 	})
 	return discoverer.Discover(ctx)
+}
+
+func commonCrawlCacheDir(dbPath string) string {
+	dir := filepath.Dir(dbPath)
+	if dir == "" || dir == "." {
+		return ".czdomains-cache"
+	}
+	return filepath.Join(dir, ".czdomains-cache")
 }
 
 func addCommonCrawlRetryFlags(flags *flag.FlagSet) *ccRetryOptions {
@@ -561,5 +571,6 @@ Sources:
 Updates:
   Release binaries stop before work when a newer GitHub Release exists.
   Run "czdomains update" to download and replace the current binary.
+  Update progress is printed to stderr.
 `)
 }

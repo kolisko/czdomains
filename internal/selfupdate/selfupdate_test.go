@@ -1,6 +1,7 @@
 package selfupdate
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -93,6 +95,7 @@ func TestUpdateReplacesExecutableAndLeavesNoTempFile(t *testing.T) {
 	}))
 	defer server.Close()
 
+	var out bytes.Buffer
 	err := Update(context.Background(), Config{
 		CurrentVersion: "v0.2.3",
 		APIURL:         server.URL + "/latest",
@@ -100,9 +103,23 @@ func TestUpdateReplacesExecutableAndLeavesNoTempFile(t *testing.T) {
 		GOOS:           "linux",
 		GOARCH:         "amd64",
 		Client:         server.Client(),
-	}, os.Stderr)
+	}, &out)
 	if err != nil {
 		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"update: checking latest release",
+		"update: latest=v0.2.4 current=v0.2.3 asset=czdomains-linux-amd64",
+		"update: downloading czdomains-linux-amd64",
+		"update: downloaded czdomains-linux-amd64",
+		"100.0%",
+		"update: verifying sha256 for czdomains-linux-amd64",
+		"update: replacing executable",
+		"czdomains updated to v0.2.4",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("update output missing %q in:\n%s", want, out.String())
+		}
 	}
 	got, err := os.ReadFile(exePath)
 	if err != nil {

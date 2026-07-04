@@ -79,6 +79,61 @@ func TestCommonCrawlDiscoveryUsesClusterRangeScan(t *testing.T) {
 	}
 }
 
+func TestCommonCrawlClusterMapUsesCache(t *testing.T) {
+	cdxPath := "cc-index/collections/CC-MAIN-2026-25/indexes/cdx-00042.gz"
+	cdxBlock := gzipData(t, `cz,example)/ 20260601000000 {"url":"https://example.cz/"}`+"\n")
+	manifest := gzipData(t, cdxPath+"\ncc-index/collections/CC-MAIN-2026-25/indexes/cluster.idx\n")
+	clusterRequests := 0
+	var progress bytes.Buffer
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/collinfo.json":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[{"id":"CC-MAIN-2026-25"}]`))
+		case "/crawl-data/CC-MAIN-2026-25/cc-index.paths.gz":
+			_, _ = w.Write(manifest)
+		case "/cc-index/collections/CC-MAIN-2026-25/indexes/cluster.idx":
+			clusterRequests++
+			_, _ = fmt.Fprintf(w, "cz,example)/ 20260601000000 %s 0 %d 1\nda,example)/ 20260601000000 %s %d 10 2\n", path.Base(cdxPath), len(cdxBlock), path.Base(cdxPath), len(cdxBlock))
+		case "/" + cdxPath:
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(cdxBlock)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	config := Config{
+		Limit:           1,
+		CollInfoURL:     server.URL + "/collinfo.json",
+		CCDataBaseURL:   server.URL,
+		CCIndexCacheDir: t.TempDir(),
+		CCFailThreshold: 1,
+		CCMaxCooldowns:  1,
+		CooldownWait:    immediateCooldownWait,
+		Progress: func(format string, args ...any) {
+			_, _ = progress.WriteString(formatString(format, args...))
+		},
+	}
+	if _, err := New(server.Client(), config).Discover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if clusterRequests != 1 {
+		t.Fatalf("cluster requests after first run=%d, want 1", clusterRequests)
+	}
+	if _, err := New(server.Client(), config).Discover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if clusterRequests != 1 {
+		t.Fatalf("cluster requests after cached second run=%d, want 1", clusterRequests)
+	}
+	if !strings.Contains(progress.String(), "using cached cluster map") {
+		t.Fatalf("progress missing cached cluster use:\n%s", progress.String())
+	}
+}
+
 func TestCommonCrawlFallsBackToSequentialScan(t *testing.T) {
 	firstPath := "cc-index/collections/CC-MAIN-2026-25/indexes/cdx-00000.gz"
 	secondPath := "cc-index/collections/CC-MAIN-2026-25/indexes/cdx-00001.gz"

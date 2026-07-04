@@ -94,6 +94,10 @@ func Latest(ctx context.Context, config Config) (Release, error) {
 
 func Update(ctx context.Context, config Config, out io.Writer) error {
 	config = withDefaults(config)
+	if out == nil {
+		out = io.Discard
+	}
+	_, _ = fmt.Fprintf(out, "update: checking latest release %s\n", config.APIURL)
 	release, err := Latest(ctx, config)
 	if err != nil {
 		return err
@@ -107,14 +111,16 @@ func Update(ctx context.Context, config Config, out io.Writer) error {
 	if !ok {
 		return fmt.Errorf("latest release %s does not contain asset %s", release.TagName, assetName)
 	}
+	_, _ = fmt.Fprintf(out, "update: latest=%s current=%s asset=%s size=%s\n", release.TagName, config.CurrentVersion, asset.Name, formatBytes(asset.Size))
 	exePath, err := executablePath(config.ExecutablePath)
 	if err != nil {
 		return err
 	}
+	_, _ = fmt.Fprintf(out, "update: executable=%s\n", exePath)
 	if err := cleanupStaleFiles(exePath); err != nil {
 		return err
 	}
-	tmpPath, err := downloadAsset(ctx, config, asset, exePath)
+	tmpPath, err := downloadAsset(ctx, config, asset, exePath, out)
 	if err != nil {
 		return err
 	}
@@ -132,6 +138,7 @@ func Update(ctx context.Context, config Config, out io.Writer) error {
 		_, _ = fmt.Fprintf(out, "czdomains update to %s has been scheduled; run czdomains again after this process exits\n", release.TagName)
 		return nil
 	}
+	_, _ = fmt.Fprintf(out, "update: replacing executable\n")
 	if err := replaceExecutable(tmpPath, exePath); err != nil {
 		return err
 	}
@@ -252,12 +259,16 @@ func tempScriptPath(exePath string) string {
 	return filepath.Join(dir, fmt.Sprintf(".%s.update.%d.cmd", base, os.Getpid()))
 }
 
-func downloadAsset(ctx context.Context, config Config, asset Asset, exePath string) (string, error) {
+func downloadAsset(ctx context.Context, config Config, asset Asset, exePath string, out io.Writer) (string, error) {
 	if asset.BrowserDownloadURL == "" {
 		return "", fmt.Errorf("asset %s does not contain browser_download_url", asset.Name)
 	}
+	if out == nil {
+		out = io.Discard
+	}
 	tmpPath := tempDownloadPath(exePath)
 	_ = os.Remove(tmpPath)
+	_, _ = fmt.Fprintf(out, "update: downloading %s from %s\n", asset.Name, asset.BrowserDownloadURL)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, asset.BrowserDownloadURL, nil)
 	if err != nil {
 		return "", err
@@ -276,7 +287,11 @@ func downloadAsset(ctx context.Context, config Config, asset Asset, exePath stri
 		return "", err
 	}
 	hash := sha256.New()
-	written, copyErr := io.Copy(io.MultiWriter(file, hash), resp.Body)
+	total := asset.Size
+	if total <= 0 && resp.ContentLength > 0 {
+		total = resp.ContentLength
+	}
+	written, copyErr := copyWithProgress(io.MultiWriter(file, hash), resp.Body, out, asset.Name, total)
 	closeErr := file.Close()
 	if copyErr != nil {
 		_ = os.Remove(tmpPath)
@@ -290,6 +305,7 @@ func downloadAsset(ctx context.Context, config Config, asset Asset, exePath stri
 		_ = os.Remove(tmpPath)
 		return "", fmt.Errorf("downloaded %d bytes for %s, expected %d", written, asset.Name, asset.Size)
 	}
+	_, _ = fmt.Fprintf(out, "update: verifying sha256 for %s\n", asset.Name)
 	if err := verifyDigest(asset, hash.Sum(nil)); err != nil {
 		_ = os.Remove(tmpPath)
 		return "", err
@@ -303,6 +319,62 @@ func downloadAsset(ctx context.Context, config Config, asset Asset, exePath stri
 		return "", err
 	}
 	return tmpPath, nil
+}
+
+func copyWithProgress(dst io.Writer, src io.Reader, out io.Writer, label string, total int64) (int64, error) {
+	buffer := make([]byte, 256*1024)
+	var written int64
+	nextProgress := time.Now()
+	for {
+		n, readErr := src.Read(buffer)
+		if n > 0 {
+			if _, err := dst.Write(buffer[:n]); err != nil {
+				return written, err
+			}
+			written += int64(n)
+			now := time.Now()
+			if !now.Before(nextProgress) {
+				_, _ = fmt.Fprintf(out, "\rupdate: downloading %s %s%s", label, formatBytes(written), formatDownloadPercent(written, total))
+				nextProgress = now.Add(250 * time.Millisecond)
+			}
+		}
+		if readErr == io.EOF {
+			_, _ = fmt.Fprintf(out, "\rupdate: downloaded %s %s%s\n", label, formatBytes(written), formatDownloadPercent(written, total))
+			return written, nil
+		}
+		if readErr != nil {
+			_, _ = fmt.Fprintln(out)
+			return written, readErr
+		}
+	}
+}
+
+func formatBytes(value int64) string {
+	const unit = 1024
+	if value <= 0 {
+		return "unknown"
+	}
+	if value < unit {
+		return fmt.Sprintf("%d B", value)
+	}
+	div := int64(unit)
+	exp := 0
+	for n := value / unit; n >= unit && exp < 4; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(value)/float64(div), "KMGTPE"[exp])
+}
+
+func formatDownloadPercent(done int64, total int64) string {
+	if total <= 0 {
+		return ""
+	}
+	percent := float64(done) * 100 / float64(total)
+	if percent > 100 {
+		percent = 100
+	}
+	return fmt.Sprintf(" / %s %.1f%%", formatBytes(total), percent)
 }
 
 func verifyDigest(asset Asset, got []byte) error {
