@@ -27,6 +27,13 @@ type domainInput struct {
 	Source string
 }
 
+type ccRetryOptions struct {
+	failThreshold int
+	cooldown      time.Duration
+	waitProgress  time.Duration
+	maxCooldowns  int
+}
+
 func main() {
 	if err := run(os.Args); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -68,11 +75,12 @@ func runDiscover(args []string) error {
 	ccIndexCount := flags.Int("cc-index-count", 0, "number of recent Common Crawl indexes to scan when --cc-index=latest; 0 scans all")
 	fresh := flags.Bool("fresh", false, "start from a fresh database and truncate --out if set")
 	timeout := flags.Duration("timeout", 60*time.Second, "HTTP timeout")
+	ccRetry := addCommonCrawlRetryFlags(flags)
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 
-	count, err := discoverToSQLite(context.Background(), *dbPath, *outPath, *fresh, *limit, *sources, *ccIndex, *ccIndexCount, *timeout)
+	count, err := discoverToSQLite(context.Background(), *dbPath, *outPath, *fresh, *limit, *sources, *ccIndex, *ccIndexCount, *timeout, *ccRetry)
 	if err != nil && count == 0 {
 		return err
 	}
@@ -157,11 +165,12 @@ func runAll(args []string) error {
 	fresh := flags.Bool("fresh", false, "start from a fresh database")
 	delay := flags.Duration("delay", 200*time.Millisecond, "delay between RDAP requests")
 	timeout := flags.Duration("timeout", 60*time.Second, "HTTP timeout")
+	ccRetry := addCommonCrawlRetryFlags(flags)
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 
-	count, err := discoverToSQLite(context.Background(), *dbPath, "", *fresh, *limit, *sources, *ccIndex, *ccIndexCount, *timeout)
+	count, err := discoverToSQLite(context.Background(), *dbPath, "", *fresh, *limit, *sources, *ccIndex, *ccIndexCount, *timeout, *ccRetry)
 	if err != nil && count == 0 {
 		return err
 	}
@@ -183,7 +192,7 @@ func runAll(args []string) error {
 	return nil
 }
 
-func discoverToSQLite(ctx context.Context, dbPath string, outPath string, fresh bool, limit int, sources string, ccIndex string, ccIndexCount int, timeout time.Duration) (int, error) {
+func discoverToSQLite(ctx context.Context, dbPath string, outPath string, fresh bool, limit int, sources string, ccIndex string, ccIndexCount int, timeout time.Duration, ccRetry ccRetryOptions) (int, error) {
 	store, err := storage.Open(dbPath, storage.Options{Fresh: fresh})
 	if err != nil {
 		return 0, err
@@ -198,12 +207,16 @@ func discoverToSQLite(ctx context.Context, dbPath string, outPath string, fresh 
 
 	client := &http.Client{Timeout: timeout}
 	discoverer := discovery.New(client, discovery.Config{
-		Limit:        limit,
-		Sources:      splitCSV(sources),
-		CCIndex:      ccIndex,
-		CCIndexCount: ccIndexCount,
-		UserAgent:    userAgent,
-		PageTracker:  store,
+		Limit:           limit,
+		Sources:         splitCSV(sources),
+		CCIndex:         ccIndex,
+		CCIndexCount:    ccIndexCount,
+		UserAgent:       userAgent,
+		PageTracker:     store,
+		CCFailThreshold: ccRetry.failThreshold,
+		CCCooldown:      ccRetry.cooldown,
+		CCWaitProgress:  ccRetry.waitProgress,
+		CCMaxCooldowns:  ccRetry.maxCooldowns,
 		Progress: func(format string, args ...any) {
 			fmt.Fprintf(os.Stderr, format, args...)
 		},
@@ -232,6 +245,15 @@ func discoverDomains(ctx context.Context, limit int, sources string, ccIndex str
 		},
 	})
 	return discoverer.Discover(ctx)
+}
+
+func addCommonCrawlRetryFlags(flags *flag.FlagSet) *ccRetryOptions {
+	opts := &ccRetryOptions{}
+	flags.IntVar(&opts.failThreshold, "cc-fail-threshold", discovery.DefaultCCFailThreshold, "Common Crawl transient failures before cooldown")
+	flags.DurationVar(&opts.cooldown, "cc-cooldown", discovery.DefaultCCCooldown, "Common Crawl cooldown after repeated transient failures")
+	flags.DurationVar(&opts.waitProgress, "cc-wait-progress", discovery.DefaultCCWaitProgress, "Common Crawl cooldown countdown refresh interval")
+	flags.IntVar(&opts.maxCooldowns, "cc-max-cooldowns", 0, "maximum Common Crawl cooldowns per request; 0 waits indefinitely")
+	return opts
 }
 
 func enrichDomains(ctx context.Context, inputs []domainInput, csvPath string, jsonlPath string, delay time.Duration, timeout time.Duration) error {
@@ -404,6 +426,10 @@ Discovery:
   --db       SQLite database for dedupe, checkpoints, and resume
   --out      Optional TXT stream of newly inserted domains only
   --fresh    Delete the old database first and truncate --out if set
+  Common Crawl waits by default after repeated transient failures:
+    --cc-fail-threshold 3, --cc-cooldown 15m, --cc-wait-progress 1s
+    --cc-max-cooldowns 0 means wait indefinitely.
+  The wait countdown updates one stderr line and does not write to stdout.
 
 Export:
   Without --out, export writes domains to stdout.

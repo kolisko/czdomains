@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,11 +23,17 @@ const (
 
 	httpAttempts        = 3
 	commonCrawlPageSize = 5
+
+	DefaultCCFailThreshold = 3
+	DefaultCCCooldown      = 15 * time.Minute
+	DefaultCCWaitProgress  = time.Second
 )
 
 type HTTPClient interface {
 	Do(req *http.Request) (*http.Response, error)
 }
+
+type CooldownWaitFunc func(ctx context.Context, duration time.Duration, progressEvery time.Duration, onProgress func(time.Duration)) error
 
 type Config struct {
 	Limit        int
@@ -38,6 +46,12 @@ type Config struct {
 	CCIndexCount int
 	PageTracker  PageTracker
 	Progress     func(format string, args ...any)
+
+	CCFailThreshold int
+	CCCooldown      time.Duration
+	CCWaitProgress  time.Duration
+	CCMaxCooldowns  int
+	CooldownWait    CooldownWaitFunc
 }
 
 type Result struct {
@@ -92,6 +106,21 @@ func New(client HTTPClient, config Config) *Discoverer {
 	}
 	if len(config.Sources) == 0 {
 		config.Sources = []string{"commoncrawl"}
+	}
+	if config.Progress == nil {
+		config.Progress = func(string, ...any) {}
+	}
+	if config.CCFailThreshold <= 0 {
+		config.CCFailThreshold = DefaultCCFailThreshold
+	}
+	if config.CCCooldown <= 0 {
+		config.CCCooldown = DefaultCCCooldown
+	}
+	if config.CCWaitProgress <= 0 {
+		config.CCWaitProgress = DefaultCCWaitProgress
+	}
+	if config.CooldownWait == nil {
+		config.CooldownWait = waitWithProgress
 	}
 	return &Discoverer{client: client, config: config}
 }
@@ -166,7 +195,7 @@ func (d *Discoverer) discoverCommonCrawl(ctx context.Context, sink Sink) error {
 		beforeIndex := total
 		if pageCount == 0 {
 			page := CrawlPage{Source: "commoncrawl", IndexURL: indexURL, Page: -1}
-			err := d.scanCommonCrawlPage(ctx, page, commonCrawlQuery(indexURL, -1, commonCrawlRawLimit(d.config.Limit)), sink, &total)
+			err := d.scanCommonCrawlPage(ctx, page, "index scan", commonCrawlQuery(indexURL, -1, commonCrawlRawLimit(d.config.Limit)), sink, &total)
 			if errors.Is(err, errLimitReached) {
 				return errors.Join(errs...)
 			}
@@ -180,7 +209,8 @@ func (d *Discoverer) discoverCommonCrawl(ctx context.Context, sink Sink) error {
 
 		for page := 0; page < pageCount; page++ {
 			crawlPage := CrawlPage{Source: "commoncrawl", IndexURL: indexURL, Page: page}
-			err := d.scanCommonCrawlPage(ctx, crawlPage, commonCrawlQuery(indexURL, page, 0), sink, &total)
+			retryLabel := fmt.Sprintf("page %d/%d", page+1, pageCount)
+			err := d.scanCommonCrawlPage(ctx, crawlPage, retryLabel, commonCrawlQuery(indexURL, page, 0), sink, &total)
 			if errors.Is(err, errLimitReached) {
 				return errors.Join(errs...)
 			}
@@ -234,7 +264,7 @@ func (d *Discoverer) commonCrawlPageCount(ctx context.Context, indexURL string) 
 
 	var lastErr error
 	for attempt := 1; attempt <= httpAttempts; attempt++ {
-		resp, err := d.getOK(ctx, query.String(), "commoncrawl page count")
+		resp, err := d.getOKWithCooldown(ctx, query.String(), "commoncrawl page count", "Common Crawl page count")
 		if err != nil {
 			return 0, err
 		}
@@ -254,7 +284,7 @@ func (d *Discoverer) commonCrawlPageCount(ctx context.Context, indexURL string) 
 	return 0, lastErr
 }
 
-func (d *Discoverer) scanCommonCrawlPage(ctx context.Context, page CrawlPage, rawURL string, sink Sink, total *int) error {
+func (d *Discoverer) scanCommonCrawlPage(ctx context.Context, page CrawlPage, retryLabel string, rawURL string, sink Sink, total *int) error {
 	if d.config.PageTracker != nil {
 		complete, err := d.config.PageTracker.PageComplete(ctx, page)
 		if err != nil {
@@ -270,8 +300,10 @@ func (d *Discoverer) scanCommonCrawlPage(ctx context.Context, page CrawlPage, ra
 	}
 
 	var lastErr error
-	for attempt := 1; attempt <= httpAttempts; attempt++ {
-		resp, err := d.getOK(ctx, rawURL, "commoncrawl")
+	transientFailures := 0
+	cooldowns := 0
+	for attempt := 1; ; attempt++ {
+		resp, err := d.getOKWithCooldown(ctx, rawURL, "commoncrawl", retryLabel)
 		if err != nil {
 			lastErr = err
 			break
@@ -318,11 +350,25 @@ func (d *Discoverer) scanCommonCrawlPage(ctx context.Context, page CrawlPage, ra
 			return nil
 		}
 		lastErr = err
+		if !isTransientError(err) {
+			break
+		}
+		cooledDown, cooldownErr := d.cooldownAfterTransient(ctx, retryLabel, err, &transientFailures, &cooldowns)
+		if cooldownErr != nil {
+			lastErr = cooldownErr
+			break
+		}
+		if cooledDown {
+			attempt = 0
+			continue
+		}
 		if attempt < httpAttempts {
 			if err := sleepBeforeRetry(ctx, attempt); err != nil {
 				return err
 			}
+			continue
 		}
+		attempt = 0
 	}
 	if d.config.PageTracker != nil && lastErr != nil {
 		if err := d.config.PageTracker.MarkPageFailed(ctx, page, lastErr); err != nil {
@@ -354,7 +400,7 @@ func (d *Discoverer) commonCrawlIndexURLs(ctx context.Context) ([]string, error)
 		return []string{fmt.Sprintf("https://index.commoncrawl.org/%s-index", d.config.CCIndex)}, nil
 	}
 
-	resp, err := d.getOK(ctx, d.config.CollInfoURL, "commoncrawl collinfo")
+	resp, err := d.getOKWithCooldown(ctx, d.config.CollInfoURL, "commoncrawl collinfo", "Common Crawl index list")
 	if err != nil {
 		return nil, err
 	}
@@ -455,24 +501,13 @@ func (d *Discoverer) newRequest(ctx context.Context, rawURL string) (*http.Reque
 func (d *Discoverer) getOK(ctx context.Context, rawURL string, label string) (*http.Response, error) {
 	var lastErr error
 	for attempt := 1; attempt <= httpAttempts; attempt++ {
-		req, err := d.newRequest(ctx, rawURL)
-		if err != nil {
-			return nil, err
-		}
-		resp, err := d.client.Do(req)
-		if err == nil && resp.StatusCode >= 200 && resp.StatusCode <= 299 {
+		resp, err := d.doRequest(ctx, rawURL, label)
+		if err == nil {
 			return resp, nil
 		}
-		if err != nil {
-			lastErr = err
-		} else {
-			lastErr = fmt.Errorf("%s returned HTTP %d", label, resp.StatusCode)
-			if resp.Body != nil {
-				_ = resp.Body.Close()
-			}
-			if !isRetriableStatus(resp.StatusCode) {
-				return nil, lastErr
-			}
+		lastErr = err
+		if !isTransientError(err) {
+			return nil, lastErr
 		}
 		if attempt < httpAttempts {
 			if err := sleepBeforeRetry(ctx, attempt); err != nil {
@@ -483,8 +518,181 @@ func (d *Discoverer) getOK(ctx context.Context, rawURL string, label string) (*h
 	return nil, lastErr
 }
 
+func (d *Discoverer) getOKWithCooldown(ctx context.Context, rawURL string, label string, retryLabel string) (*http.Response, error) {
+	var lastErr error
+	transientFailures := 0
+	cooldowns := 0
+	for attempt := 1; ; attempt++ {
+		resp, err := d.doRequest(ctx, rawURL, label)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		if !isTransientError(err) {
+			return nil, lastErr
+		}
+		cooledDown, cooldownErr := d.cooldownAfterTransient(ctx, retryLabel, err, &transientFailures, &cooldowns)
+		if cooldownErr != nil {
+			return nil, cooldownErr
+		}
+		if cooledDown {
+			attempt = 0
+			continue
+		}
+		if attempt < httpAttempts {
+			if err := sleepBeforeRetry(ctx, attempt); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		attempt = 0
+	}
+}
+
+func (d *Discoverer) doRequest(ctx context.Context, rawURL string, label string) (*http.Response, error) {
+	req, err := d.newRequest(ctx, rawURL)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
+		return resp, nil
+	}
+	statusErr := httpStatusError{
+		label:      label,
+		status:     resp.StatusCode,
+		retryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
+	}
+	if resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	return nil, statusErr
+}
+
+type httpStatusError struct {
+	label      string
+	status     int
+	retryAfter time.Duration
+}
+
+func (e httpStatusError) Error() string {
+	return fmt.Sprintf("%s returned HTTP %d", e.label, e.status)
+}
+
 func isRetriableStatus(status int) bool {
 	return status == http.StatusTooManyRequests || status >= 500
+}
+
+func isTransientError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var statusErr httpStatusError
+	if errors.As(err, &statusErr) {
+		return isRetriableStatus(statusErr.status)
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary()) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "connection refused") ||
+		strings.Contains(message, "unexpected eof") ||
+		strings.Contains(message, "eof")
+}
+
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(value); err == nil {
+		if seconds <= 0 {
+			return 0
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	when, err := http.ParseTime(value)
+	if err != nil {
+		return 0
+	}
+	if !when.After(now) {
+		return 0
+	}
+	return when.Sub(now)
+}
+
+func retryAfter(err error) time.Duration {
+	var statusErr httpStatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.retryAfter
+	}
+	return 0
+}
+
+func (d *Discoverer) cooldownAfterTransient(ctx context.Context, retryLabel string, err error, transientFailures *int, cooldowns *int) (bool, error) {
+	(*transientFailures)++
+	if *transientFailures < d.config.CCFailThreshold {
+		return false, nil
+	}
+	*transientFailures = 0
+	if d.config.CCMaxCooldowns > 0 && *cooldowns >= d.config.CCMaxCooldowns {
+		return false, err
+	}
+	*cooldowns++
+	duration := retryAfter(err)
+	if duration <= 0 {
+		duration = d.config.CCCooldown
+	}
+	d.progress("commoncrawl: transient failures %d/%d, cooling down for %s: %v\n", d.config.CCFailThreshold, d.config.CCFailThreshold, duration.Round(time.Second), err)
+	waitErr := d.config.CooldownWait(ctx, duration, d.config.CCWaitProgress, func(remaining time.Duration) {
+		if remaining < 0 {
+			remaining = 0
+		}
+		d.progress("\rcommoncrawl: waiting %s before retrying %s   ", remaining.Round(time.Second), retryLabel)
+	})
+	if waitErr != nil {
+		d.progress("\n")
+		return true, waitErr
+	}
+	d.progress("\rcommoncrawl: retrying %s after cooldown\n", retryLabel)
+	return true, nil
+}
+
+func waitWithProgress(ctx context.Context, duration time.Duration, progressEvery time.Duration, onProgress func(time.Duration)) error {
+	if duration <= 0 {
+		onProgress(0)
+		return nil
+	}
+	if progressEvery <= 0 {
+		progressEvery = duration
+	}
+	deadline := time.Now().Add(duration)
+	onProgress(duration)
+	timer := time.NewTimer(duration)
+	ticker := time.NewTicker(progressEvery)
+	defer timer.Stop()
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			onProgress(time.Until(deadline))
+		case <-timer.C:
+			onProgress(0)
+			return nil
+		}
+	}
 }
 
 func sleepBeforeRetry(ctx context.Context, attempt int) error {

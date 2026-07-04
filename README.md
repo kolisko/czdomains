@@ -34,6 +34,16 @@ czdomains discover --limit 1000000 --db czdomains.sqlite
 czdomains discover --limit 10000 --cc-index-count 3 --db quick-sample.sqlite
 ```
 
+Common Crawl retries are conservative by default. After 3 transient failures such as EOF, connection refused, timeout, HTTP 429, or HTTP 5xx, `czdomains` waits 15 minutes and retries the same request instead of skipping it. During the wait it shows a single updating countdown line on stderr, so stdout exports and pipelines stay clean.
+
+The retry defaults can be tuned when needed:
+
+```sh
+czdomains discover --cc-fail-threshold 3 --cc-cooldown 15m --cc-wait-progress 1s --cc-max-cooldowns 0
+```
+
+`--cc-max-cooldowns 0` means wait indefinitely until the request succeeds or the process is interrupted. Common Crawl `pageSize` is intentionally kept unchanged for checkpoint compatibility with existing SQLite databases.
+
 You can add `crt.sh`, but it is often rate-limited or temporarily unavailable:
 
 ```sh
@@ -77,7 +87,8 @@ Discovery is designed for large best-effort runs:
 - Domains are written into SQLite as they are found.
 - Uniqueness is enforced by the database primary key, not an in-memory map.
 - Completed Common Crawl pages are checkpointed and skipped on later runs.
-- HTTP failures are recorded per page and do not discard already discovered domains.
+- Transient Common Crawl failures trigger a default cooldown and retry the same request.
+- HTTP failures that remain after configured cooldown limits are recorded per page and do not discard already discovered domains.
 
 RDAP enrichment is intentionally rate-limited because it queries CZ.NIC RDAP per domain. For very large databases, expect enrichment to take much longer than discovery.
 
