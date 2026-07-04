@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -164,6 +165,79 @@ func TestCommonCrawlDoesNotSequentialFallbackAfterClusterFailure(t *testing.T) {
 	}
 	if cdxRequests != 0 {
 		t.Fatalf("sequential CDX fallback made %d request(s)", cdxRequests)
+	}
+}
+
+func TestCommonCrawlClusterDownloadResumesAfterStall(t *testing.T) {
+	cdxPath := "cc-index/collections/CC-MAIN-2026-25/indexes/cdx-00042.gz"
+	cdxBlock := gzipData(t, `cz,example)/ 20260601000000 {"url":"https://example.cz/"}`+"\n")
+	clusterData := []byte(fmt.Sprintf("cz,example)/ 20260601000000 %s 0 %d 1\nda,example)/ 20260601000000 %s %d 10 2\n", cdxPath, len(cdxBlock), cdxPath, len(cdxBlock)))
+	cut := len(clusterData) / 2
+	manifest := gzipData(t, cdxPath+"\ncc-index/collections/CC-MAIN-2026-25/indexes/cluster.idx\n")
+	var clusterRanges []string
+	var progress bytes.Buffer
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/collinfo.json":
+			_, _ = w.Write([]byte(`[{"id":"CC-MAIN-2026-25"}]`))
+		case "/crawl-data/CC-MAIN-2026-25/cc-index.paths.gz":
+			_, _ = w.Write(manifest)
+		case "/cc-index/collections/CC-MAIN-2026-25/indexes/cluster.idx":
+			clusterRanges = append(clusterRanges, r.Header.Get("Range"))
+			if r.Header.Get("Range") == "" {
+				w.Header().Set("Content-Length", strconv.Itoa(len(clusterData)))
+				_, _ = w.Write(clusterData[:cut])
+				if flusher, ok := w.(http.Flusher); ok {
+					flusher.Flush()
+				}
+				<-r.Context().Done()
+				return
+			}
+			if r.Header.Get("Range") != fmt.Sprintf("bytes=%d-", cut) {
+				t.Errorf("unexpected resume range %q", r.Header.Get("Range"))
+			}
+			w.Header().Set("Content-Length", strconv.Itoa(len(clusterData)-cut))
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", cut, len(clusterData)-1, len(clusterData)))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(clusterData[cut:])
+		case "/" + cdxPath:
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(cdxBlock)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	d := New(server.Client(), Config{
+		Limit:              10,
+		CollInfoURL:        server.URL + "/collinfo.json",
+		CCDataBaseURL:      server.URL,
+		CCFailThreshold:    1,
+		CCStallTimeout:     10 * time.Millisecond,
+		CCDownloadProgress: time.Millisecond,
+		CCMaxCooldowns:     1,
+		CooldownWait:       immediateCooldownWait,
+		Progress: func(format string, args ...any) {
+			_, _ = progress.WriteString(formatString(format, args...))
+		},
+	})
+	got, err := d.Discover(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 1 || got[0].Domain != "example.cz" {
+		t.Fatalf("unexpected domains: %v", got)
+	}
+	if len(clusterRanges) != 2 || clusterRanges[0] != "" || clusterRanges[1] != fmt.Sprintf("bytes=%d-", cut) {
+		t.Fatalf("cluster ranges=%v, want initial request then resume at %d", clusterRanges, cut)
+	}
+	out := progress.String()
+	for _, want := range []string{"downloading cluster.idx", "resuming cluster.idx", "downloaded cluster.idx"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("progress missing %q in:\n%s", want, out)
+		}
 	}
 }
 

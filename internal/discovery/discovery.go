@@ -11,26 +11,30 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"czdomains/internal/domainutil"
 )
 
 const (
-	DefaultCollInfoURL       = "https://index.commoncrawl.org/collinfo.json"
-	DefaultCCCollectionsURL  = "https://data.commoncrawl.org/cc-index/collections/index.html"
-	DefaultCCDataBaseURL     = "https://data.commoncrawl.org/"
-	DefaultCRTShURL          = "https://crt.sh/"
-	httpAttempts             = 3
-	DefaultCCFailThreshold   = 3
-	DefaultCCCooldown        = 15 * time.Minute
-	DefaultCCWaitProgress    = time.Second
-	maxCommonCrawlLineLength = 8 * 1024 * 1024
+	DefaultCollInfoURL        = "https://index.commoncrawl.org/collinfo.json"
+	DefaultCCCollectionsURL   = "https://data.commoncrawl.org/cc-index/collections/index.html"
+	DefaultCCDataBaseURL      = "https://data.commoncrawl.org/"
+	DefaultCRTShURL           = "https://crt.sh/"
+	httpAttempts              = 3
+	DefaultCCFailThreshold    = 3
+	DefaultCCCooldown         = 15 * time.Minute
+	DefaultCCWaitProgress     = time.Second
+	DefaultCCStallTimeout     = 60 * time.Second
+	DefaultCCDownloadProgress = 5 * time.Second
+	maxCommonCrawlLineLength  = 8 * 1024 * 1024
 )
 
 type HTTPClient interface {
@@ -53,11 +57,13 @@ type Config struct {
 	BlockTracker     BlockTracker
 	Progress         func(format string, args ...any)
 
-	CCFailThreshold int
-	CCCooldown      time.Duration
-	CCWaitProgress  time.Duration
-	CCMaxCooldowns  int
-	CooldownWait    CooldownWaitFunc
+	CCFailThreshold    int
+	CCCooldown         time.Duration
+	CCWaitProgress     time.Duration
+	CCStallTimeout     time.Duration
+	CCDownloadProgress time.Duration
+	CCMaxCooldowns     int
+	CooldownWait       CooldownWaitFunc
 }
 
 type Result struct {
@@ -102,7 +108,7 @@ type ccCrawl struct {
 
 type ccManifest struct {
 	CDXPaths     []string
-	ClusterPath string
+	ClusterPath  string
 	MetadataPath string
 }
 
@@ -115,6 +121,7 @@ type ccClusterBlock struct {
 
 var (
 	errLimitReached      = errors.New("discovery limit reached")
+	errDownloadStalled   = errors.New("download stalled")
 	crawlIDPattern       = regexp.MustCompile(`CC-MAIN-(?:\d{4}-\d{4}|\d{4}-\d{2}|\d{4})`)
 	crawlIDSortKeyRegexp = regexp.MustCompile(`^CC-MAIN-(\d{4})(?:-(\d{2,4}))?$`)
 )
@@ -152,6 +159,12 @@ func New(client HTTPClient, config Config) *Discoverer {
 	}
 	if config.CCWaitProgress <= 0 {
 		config.CCWaitProgress = DefaultCCWaitProgress
+	}
+	if config.CCStallTimeout <= 0 {
+		config.CCStallTimeout = DefaultCCStallTimeout
+	}
+	if config.CCDownloadProgress <= 0 {
+		config.CCDownloadProgress = DefaultCCDownloadProgress
 	}
 	if config.CooldownWait == nil {
 		config.CooldownWait = waitWithProgress
@@ -393,13 +406,20 @@ func parseCommonCrawlManifest(r io.Reader) (ccManifest, error) {
 func (d *Discoverer) scanCommonCrawlWithCluster(ctx context.Context, crawl ccCrawl, manifest ccManifest, sink Sink, total *int) error {
 	clusterURL := d.commonCrawlDataURL(manifest.ClusterPath)
 	d.progress("commoncrawl: downloading cluster map %s\n", clusterURL)
-	resp, err := d.getOKWithCooldown(ctx, clusterURL, "commoncrawl cluster", fmt.Sprintf("cluster.idx %s", crawl.ID))
+	clusterFile, err := d.downloadCommonCrawlObjectToTemp(ctx, clusterURL, fmt.Sprintf("cluster.idx %s", crawl.ID))
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		name := clusterFile.Name()
+		_ = clusterFile.Close()
+		_ = os.Remove(name)
+	}()
+	if _, err := clusterFile.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
 
-	blocks, err := parseCommonCrawlCluster(resp.Body)
+	blocks, err := parseCommonCrawlCluster(clusterFile)
 	if err != nil {
 		return err
 	}
@@ -419,6 +439,143 @@ func (d *Discoverer) scanCommonCrawlWithCluster(ctx context.Context, crawl ccCra
 		}
 	}
 	return nil
+}
+
+func (d *Discoverer) downloadCommonCrawlObjectToTemp(ctx context.Context, rawURL string, label string) (*os.File, error) {
+	file, err := os.CreateTemp("", "czdomains-commoncrawl-*")
+	if err != nil {
+		return nil, err
+	}
+	cleanup := true
+	defer func() {
+		if cleanup {
+			name := file.Name()
+			_ = file.Close()
+			_ = os.Remove(name)
+		}
+	}()
+
+	var downloaded int64
+	var total int64 = -1
+	var lastErr error
+	transientFailures := 0
+	cooldowns := 0
+	for attempt := 1; ; attempt++ {
+		if downloaded > 0 {
+			d.progress("commoncrawl: resuming %s at byte %d\n", label, downloaded)
+		}
+		requestCtx, cancel := context.WithCancel(ctx)
+		resp, err := d.doResumableRequest(requestCtx, rawURL, downloaded, "commoncrawl download")
+		if err == nil {
+			if downloaded > 0 && resp.StatusCode == http.StatusOK {
+				d.progress("commoncrawl: server ignored resume for %s; restarting download from byte 0\n", label)
+				if err := file.Truncate(0); err != nil {
+					cancel()
+					_ = resp.Body.Close()
+					return nil, err
+				}
+				if _, err := file.Seek(0, io.SeekStart); err != nil {
+					cancel()
+					_ = resp.Body.Close()
+					return nil, err
+				}
+				downloaded = 0
+				total = -1
+			}
+			if nextTotal := responseTotalSize(resp, downloaded); nextTotal > 0 {
+				total = nextTotal
+			}
+			err = d.copyResponseBodyWithProgress(requestCtx, cancel, file, resp.Body, label, &downloaded, total)
+			_ = resp.Body.Close()
+			cancel()
+			if err == nil {
+				d.progress("\rcommoncrawl: downloaded %s %s%s\n", label, formatBytes(downloaded), formatDownloadPercent(downloaded, total))
+				if _, err := file.Seek(0, io.SeekStart); err != nil {
+					return nil, err
+				}
+				cleanup = false
+				return file, nil
+			}
+		} else {
+			cancel()
+		}
+		lastErr = err
+		if !isTransientError(err) {
+			return nil, lastErr
+		}
+		cooledDown, cooldownErr := d.cooldownAfterTransient(ctx, label, err, &transientFailures, &cooldowns)
+		if cooldownErr != nil {
+			return nil, cooldownErr
+		}
+		if cooledDown {
+			attempt = 0
+			continue
+		}
+		if attempt < httpAttempts {
+			d.progress("commoncrawl: retrying %s after transient error: %v\n", label, err)
+			if err := sleepBeforeRetry(ctx, attempt); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		attempt = 0
+	}
+}
+
+func (d *Discoverer) copyResponseBodyWithProgress(ctx context.Context, cancel context.CancelFunc, dst io.Writer, src io.Reader, label string, downloaded *int64, total int64) error {
+	buffer := make([]byte, 256*1024)
+	nextProgress := time.Now()
+	var stalled atomic.Bool
+	timer := time.AfterFunc(d.config.CCStallTimeout, func() {
+		stalled.Store(true)
+		cancel()
+	})
+	defer timer.Stop()
+
+	report := func(final bool) {
+		now := time.Now()
+		if !final && now.Before(nextProgress) {
+			return
+		}
+		nextProgress = now.Add(d.config.CCDownloadProgress)
+		d.progress("\rcommoncrawl: downloading %s %s%s", label, formatBytes(*downloaded), formatDownloadPercent(*downloaded, total))
+	}
+	report(false)
+
+	for {
+		n, err := src.Read(buffer)
+		if n > 0 {
+			if _, writeErr := dst.Write(buffer[:n]); writeErr != nil {
+				return writeErr
+			}
+			*downloaded += int64(n)
+			stalled.Store(false)
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(d.config.CCStallTimeout)
+			report(false)
+		}
+		if err == io.EOF {
+			report(true)
+			return nil
+		}
+		if err != nil {
+			if stalled.Load() || errors.Is(ctx.Err(), context.Canceled) {
+				return fmt.Errorf("%w after %s while downloading %s", errDownloadStalled, d.config.CCStallTimeout.Round(time.Second), label)
+			}
+			return err
+		}
+		if ctx.Err() != nil {
+			if stalled.Load() {
+				return fmt.Errorf("%w after %s while downloading %s", errDownloadStalled, d.config.CCStallTimeout.Round(time.Second), label)
+			}
+			return ctx.Err()
+		}
+	}
 }
 
 func parseCommonCrawlCluster(r io.Reader) ([]ccClusterBlock, error) {
@@ -952,6 +1109,86 @@ func (d *Discoverer) doRangeRequest(ctx context.Context, rawURL string, offset i
 	return nil, statusErr
 }
 
+func (d *Discoverer) doResumableRequest(ctx context.Context, rawURL string, offset int64, label string) (*http.Response, error) {
+	req, err := d.newRequest(ctx, rawURL)
+	if err != nil {
+		return nil, err
+	}
+	if offset > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
+	}
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if offset == 0 && resp.StatusCode >= 200 && resp.StatusCode <= 299 {
+		return resp, nil
+	}
+	if offset > 0 && (resp.StatusCode == http.StatusPartialContent || resp.StatusCode == http.StatusOK) {
+		return resp, nil
+	}
+	statusErr := httpStatusError{
+		label:      label,
+		status:     resp.StatusCode,
+		retryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
+	}
+	if resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	return nil, statusErr
+}
+
+func responseTotalSize(resp *http.Response, offset int64) int64 {
+	if total := parseContentRangeTotal(resp.Header.Get("Content-Range")); total > 0 {
+		return total
+	}
+	if resp.ContentLength > 0 {
+		return offset + resp.ContentLength
+	}
+	return -1
+}
+
+func parseContentRangeTotal(value string) int64 {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return -1
+	}
+	slash := strings.LastIndexByte(value, '/')
+	if slash < 0 || slash == len(value)-1 {
+		return -1
+	}
+	total, err := strconv.ParseInt(value[slash+1:], 10, 64)
+	if err != nil || total <= 0 {
+		return -1
+	}
+	return total
+}
+
+func formatBytes(value int64) string {
+	const unit = 1024
+	if value < unit {
+		return fmt.Sprintf("%d B", value)
+	}
+	div := int64(unit)
+	exp := 0
+	for n := value / unit; n >= unit && exp < 4; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(value)/float64(div), "KMGTPE"[exp])
+}
+
+func formatDownloadPercent(done int64, total int64) string {
+	if total <= 0 {
+		return ""
+	}
+	percent := float64(done) * 100 / float64(total)
+	if percent > 100 {
+		percent = 100
+	}
+	return fmt.Sprintf(" / %s %.1f%%", formatBytes(total), percent)
+}
+
 type httpStatusError struct {
 	label      string
 	status     int
@@ -975,6 +1212,9 @@ func isTransientError(err error) bool {
 		return isRetriableStatus(statusErr.status)
 	}
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	if errors.Is(err, errDownloadStalled) {
 		return true
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
