@@ -247,10 +247,10 @@ func (d *Discoverer) scanCommonCrawlCrawl(ctx context.Context, crawl ccCrawl, si
 		if err == nil || errors.Is(err, errLimitReached) {
 			return err
 		}
-		d.progress("commoncrawl: cluster range scan failed, switching to sequential fallback: %v\n", err)
+		return fmt.Errorf("commoncrawl: cluster range scan failed; not switching to sequential CDX download because cluster.idx is present: %w", err)
 	}
 
-	d.progress("commoncrawl: scan mode sequential fallback\n")
+	d.progress("commoncrawl: scan mode sequential fallback (manifest has no cluster.idx)\n")
 	return d.scanCommonCrawlSequential(ctx, crawl, manifest.CDXPaths, sink, total)
 }
 

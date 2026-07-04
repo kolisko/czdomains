@@ -128,6 +128,45 @@ func TestCommonCrawlFallsBackToSequentialScan(t *testing.T) {
 	}
 }
 
+func TestCommonCrawlDoesNotSequentialFallbackAfterClusterFailure(t *testing.T) {
+	cdxPath := "cc-index/collections/CC-MAIN-2026-25/indexes/cdx-00000.gz"
+	manifest := gzipData(t, cdxPath+"\ncc-index/collections/CC-MAIN-2026-25/indexes/cluster.idx\n")
+	cdxRequests := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/collinfo.json":
+			_, _ = w.Write([]byte(`[{"id":"CC-MAIN-2026-25"}]`))
+		case "/crawl-data/CC-MAIN-2026-25/cc-index.paths.gz":
+			_, _ = w.Write(manifest)
+		case "/cc-index/collections/CC-MAIN-2026-25/indexes/cluster.idx":
+			http.Error(w, "slow cluster", http.StatusServiceUnavailable)
+		case "/" + cdxPath:
+			cdxRequests++
+			_, _ = w.Write(gzipData(t, `cz,example)/ 20260601000000 {"url":"https://example.cz/"}`+"\n"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	d := New(server.Client(), Config{
+		Limit:           10,
+		CollInfoURL:     server.URL + "/collinfo.json",
+		CCDataBaseURL:   server.URL,
+		CCFailThreshold: 1,
+		CCMaxCooldowns:  1,
+		CooldownWait:    immediateCooldownWait,
+	})
+	_, err := d.Discover(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "not switching to sequential CDX download") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cdxRequests != 0 {
+		t.Fatalf("sequential CDX fallback made %d request(s)", cdxRequests)
+	}
+}
+
 func TestCommonCrawlCrawlLookupFallsBackToHTMLAndSorts(t *testing.T) {
 	cooldowns := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

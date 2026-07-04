@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -118,7 +119,7 @@ func runDiscover(args []string) error {
 	ccIndex := flags.String("cc-index", "latest", "Common Crawl crawl id (for example CC-MAIN-2026-25) or latest")
 	ccIndexCount := flags.Int("cc-index-count", 0, "number of recent Common Crawl crawls to scan when --cc-index=latest; 0 scans the newest crawl")
 	fresh := flags.Bool("fresh", false, "start from a fresh database and truncate --out if set")
-	timeout := flags.Duration("timeout", 60*time.Second, "HTTP timeout")
+	timeout := flags.Duration("timeout", 60*time.Second, "HTTP connect and response-header timeout")
 	ccRetry := addCommonCrawlRetryFlags(flags)
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -208,7 +209,7 @@ func runAll(args []string) error {
 	ccIndexCount := flags.Int("cc-index-count", 0, "number of recent Common Crawl crawls to scan when --cc-index=latest; 0 scans the newest crawl")
 	fresh := flags.Bool("fresh", false, "start from a fresh database")
 	delay := flags.Duration("delay", 200*time.Millisecond, "delay between RDAP requests")
-	timeout := flags.Duration("timeout", 60*time.Second, "HTTP timeout")
+	timeout := flags.Duration("timeout", 60*time.Second, "HTTP connect and response-header timeout")
 	ccRetry := addCommonCrawlRetryFlags(flags)
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -255,7 +256,7 @@ func discoverToSQLite(ctx context.Context, dbPath string, outPath string, fresh 
 	}
 	defer sink.Close()
 
-	client := &http.Client{Timeout: timeout}
+	client := discoveryHTTPClient(timeout)
 	fmt.Fprintf(os.Stderr, "discovery: db=%s limit=%d sources=%s cc-index=%s cc-index-count=%d\n", dbPath, limit, sources, ccIndex, ccIndexCount)
 	discoverer := discovery.New(client, discovery.Config{
 		Limit:           limit,
@@ -284,7 +285,7 @@ func discoverToSQLite(ctx context.Context, dbPath string, outPath string, fresh 
 }
 
 func discoverDomains(ctx context.Context, limit int, sources string, ccIndex string, ccIndexCount int, timeout time.Duration) ([]discovery.Result, error) {
-	client := &http.Client{Timeout: timeout}
+	client := discoveryHTTPClient(timeout)
 	discoverer := discovery.New(client, discovery.Config{
 		Limit:        limit,
 		Sources:      splitCSV(sources),
@@ -305,6 +306,24 @@ func addCommonCrawlRetryFlags(flags *flag.FlagSet) *ccRetryOptions {
 	flags.DurationVar(&opts.waitProgress, "cc-wait-progress", discovery.DefaultCCWaitProgress, "Common Crawl cooldown countdown refresh interval")
 	flags.IntVar(&opts.maxCooldowns, "cc-max-cooldowns", 0, "maximum Common Crawl cooldowns per request; 0 waits indefinitely")
 	return opts
+}
+
+func discoveryHTTPClient(timeout time.Duration) *http.Client {
+	if timeout <= 0 {
+		return &http.Client{}
+	}
+	return &http.Client{
+		Transport: &http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
+			DialContext:           (&net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}).DialContext,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   timeout,
+			ResponseHeaderTimeout: timeout,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
+	}
 }
 
 func requiresLatestCheck(command string) bool {

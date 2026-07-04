@@ -31,7 +31,7 @@ Use `--fresh` when you explicitly want to delete the previous database and start
 czdomains discover --fresh --limit 10000 --db czdomains.sqlite
 ```
 
-The default discovery source is Common Crawl. `czdomains` reads Common Crawl data files from `data.commoncrawl.org`: it resolves a crawl, downloads `cc-index.paths.gz`, uses `cluster.idx` when available to fetch only relevant `cdx-*.gz` byte ranges, and falls back to sequential CDX streaming if needed.
+The default discovery source is Common Crawl. `czdomains` reads Common Crawl data files from `data.commoncrawl.org`: it resolves a crawl, downloads `cc-index.paths.gz`, and uses `cluster.idx` when available to fetch only relevant `cdx-*.gz` byte ranges. Sequential CDX streaming is used only for crawls whose manifest does not contain `cluster.idx`; if a present cluster map fails, discovery stops instead of downloading every CDX file.
 
 ```sh
 czdomains discover --source commoncrawl --limit 1000
