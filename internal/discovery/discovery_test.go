@@ -139,6 +139,73 @@ func TestCommonCrawlClusterScanDownloadsEachCDXFileOnce(t *testing.T) {
 	}
 }
 
+func TestCommonCrawlClusterScanShowsImportProgressAndIgnoresOldRangeCheckpoint(t *testing.T) {
+	cdxPath := "cc-index/collections/CC-MAIN-2026-25/indexes/cdx-00042.gz"
+	cdxFile := gzipData(t, strings.Join([]string{
+		`cz,one)/ 20260601000000 {"url":"https://one.cz/"}`,
+		`cz,two)/ 20260601000000 {"url":"https://two.cz/"}`,
+	}, "\n")+"\n")
+	manifest := gzipData(t, cdxPath+"\ncc-index/collections/CC-MAIN-2026-25/indexes/cluster.idx\n")
+	cdxRequests := 0
+	var progress bytes.Buffer
+	tracker := &spyBlockTracker{
+		completed: map[CrawlBlock]bool{
+			{Source: "commoncrawl", Crawl: "CC-MAIN-2026-25", IndexFile: cdxPath, Block: 0}: true,
+		},
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/collinfo.json":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[{"id":"CC-MAIN-2026-25"}]`))
+		case "/crawl-data/CC-MAIN-2026-25/cc-index.paths.gz":
+			_, _ = w.Write(manifest)
+		case "/cc-index/collections/CC-MAIN-2026-25/indexes/cluster.idx":
+			_, _ = fmt.Fprintf(w, "cz,one)/ 20260601000000 %s 0 10 1\nda,example)/ 20260601000000 %s 10 10 2\n", path.Base(cdxPath), path.Base(cdxPath))
+		case "/" + cdxPath:
+			cdxRequests++
+			_, _ = w.Write(cdxFile)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	d := New(server.Client(), Config{
+		Limit:           10,
+		CollInfoURL:     server.URL + "/collinfo.json",
+		CCDataBaseURL:   server.URL,
+		BlockTracker:    tracker,
+		CCFailThreshold: 1,
+		CCMaxCooldowns:  1,
+		CooldownWait:    immediateCooldownWait,
+		Progress: func(format string, args ...any) {
+			_, _ = progress.WriteString(formatString(format, args...))
+		},
+	})
+	got, err := d.Discover(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cdxRequests != 1 {
+		t.Fatalf("cdx requests=%d, want 1; old block=0 checkpoint should not skip full-file scan", cdxRequests)
+	}
+	if len(got) != 2 {
+		t.Fatalf("unexpected domains: %v", got)
+	}
+	fullFileBlock := CrawlBlock{Source: "commoncrawl", Crawl: "CC-MAIN-2026-25", IndexFile: cdxPath, Block: commonCrawlFullFileBlock}
+	if !tracker.completed[fullFileBlock] {
+		t.Fatalf("full-file checkpoint was not marked completed: %+v", tracker.completed)
+	}
+	out := progress.String()
+	for _, want := range []string{"scanning/importing CDX CC-MAIN-2026-25 cdx-00042.gz", "lines=", "cz-lines=", "file-new=2"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("progress missing %q in:\n%s", want, out)
+		}
+	}
+}
+
 func TestCommonCrawlClusterMapUsesCache(t *testing.T) {
 	cdxPath := "cc-index/collections/CC-MAIN-2026-25/indexes/cdx-00042.gz"
 	cdxFile := gzipData(t, `cz,example)/ 20260601000000 {"url":"https://example.cz/"}`+"\n")
@@ -631,6 +698,37 @@ func formatString(format string, args ...any) string {
 		return format
 	}
 	return fmt.Sprintf(format, args...)
+}
+
+type spyBlockTracker struct {
+	completed map[CrawlBlock]bool
+	started   []CrawlBlock
+	failed    []CrawlBlock
+}
+
+func (t *spyBlockTracker) BlockComplete(_ context.Context, block CrawlBlock) (bool, error) {
+	if t.completed == nil {
+		return false, nil
+	}
+	return t.completed[block], nil
+}
+
+func (t *spyBlockTracker) MarkBlockStarted(_ context.Context, block CrawlBlock) error {
+	t.started = append(t.started, block)
+	return nil
+}
+
+func (t *spyBlockTracker) MarkBlockCompleted(_ context.Context, block CrawlBlock) error {
+	if t.completed == nil {
+		t.completed = map[CrawlBlock]bool{}
+	}
+	t.completed[block] = true
+	return nil
+}
+
+func (t *spyBlockTracker) MarkBlockFailed(_ context.Context, block CrawlBlock, _ error) error {
+	t.failed = append(t.failed, block)
+	return nil
 }
 
 type sequenceResponse struct {

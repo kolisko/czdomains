@@ -36,6 +36,7 @@ const (
 	DefaultCCStallTimeout     = 60 * time.Second
 	DefaultCCDownloadProgress = 5 * time.Second
 	maxCommonCrawlLineLength  = 8 * 1024 * 1024
+	commonCrawlFullFileBlock  = -1
 )
 
 type HTTPClient interface {
@@ -465,7 +466,7 @@ func cdxPathsFromClusterBlocks(blocks []ccClusterBlock) []string {
 }
 
 func (d *Discoverer) scanCommonCrawlClusterCDXFile(ctx context.Context, crawl ccCrawl, cdxPath string, sink Sink, total *int, fileIndex int, fileCount int, crawlBefore int) error {
-	crawlBlock := CrawlBlock{Source: "commoncrawl", Crawl: crawl.ID, IndexFile: cdxPath, Block: 0}
+	crawlBlock := CrawlBlock{Source: "commoncrawl", Crawl: crawl.ID, IndexFile: cdxPath, Block: commonCrawlFullFileBlock}
 	if d.config.BlockTracker != nil {
 		complete, err := d.config.BlockTracker.BlockComplete(ctx, crawlBlock)
 		if err != nil {
@@ -491,7 +492,12 @@ func (d *Discoverer) scanCommonCrawlClusterCDXFile(ctx context.Context, crawl cc
 			}
 			return err
 		}
-		_, _, err = d.scanCommonCrawlSequentialGzip(ctx, file, crawlBlock, sink, total)
+		compressedSize := int64(-1)
+		if stat, statErr := file.Stat(); statErr == nil {
+			compressedSize = stat.Size()
+		}
+		fileBefore := *total
+		_, _, err = d.scanCommonCrawlSequentialGzip(ctx, file, crawlBlock, sink, total, fmt.Sprintf("CDX %s %s", crawl.ID, path.Base(cdxPath)), compressedSize, fileBefore)
 		cleanup()
 		if err == nil {
 			if d.config.BlockTracker != nil {
@@ -891,7 +897,7 @@ func (d *Discoverer) scanCommonCrawlSequential(ctx context.Context, crawl ccCraw
 	seenCZ := false
 	inlineProgress := false
 	for i, cdxPath := range cdxPaths {
-		crawlBlock := CrawlBlock{Source: "commoncrawl", Crawl: crawl.ID, IndexFile: cdxPath, Block: 0}
+		crawlBlock := CrawlBlock{Source: "commoncrawl", Crawl: crawl.ID, IndexFile: cdxPath, Block: commonCrawlFullFileBlock}
 		if d.config.BlockTracker != nil {
 			complete, err := d.config.BlockTracker.BlockComplete(ctx, crawlBlock)
 			if err != nil {
@@ -919,7 +925,7 @@ func (d *Discoverer) scanCommonCrawlSequential(ctx context.Context, crawl ccCraw
 			}
 			return err
 		}
-		hitCZ, passedCZ, scanErr := d.scanCommonCrawlSequentialGzip(ctx, resp.Body, crawlBlock, sink, total)
+		hitCZ, passedCZ, scanErr := d.scanCommonCrawlSequentialGzip(ctx, resp.Body, crawlBlock, sink, total, fmt.Sprintf("CDX %s %s", crawl.ID, path.Base(cdxPath)), resp.ContentLength, fileBefore)
 		_ = resp.Body.Close()
 		if scanErr != nil {
 			if inlineProgress {
@@ -951,8 +957,20 @@ func (d *Discoverer) scanCommonCrawlSequential(ctx context.Context, crawl ccCraw
 	return nil
 }
 
-func (d *Discoverer) scanCommonCrawlSequentialGzip(ctx context.Context, r io.Reader, block CrawlBlock, sink Sink, total *int) (bool, bool, error) {
-	gz, err := gzip.NewReader(r)
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	r.n += int64(n)
+	return n, err
+}
+
+func (d *Discoverer) scanCommonCrawlSequentialGzip(ctx context.Context, r io.Reader, block CrawlBlock, sink Sink, total *int, label string, compressedSize int64, fileBefore int) (bool, bool, error) {
+	counting := &countingReader{r: r}
+	gz, err := gzip.NewReader(counting)
 	if err != nil {
 		return false, false, err
 	}
@@ -961,27 +979,58 @@ func (d *Discoverer) scanCommonCrawlSequentialGzip(ctx context.Context, r io.Rea
 	scanner.Buffer(make([]byte, 0, 64*1024), maxCommonCrawlLineLength)
 	hitCZ := false
 	passedCZ := false
+	lines := 0
+	czLines := 0
+	nextProgress := time.Now()
+	progressShown := false
+	report := func(final bool) {
+		now := time.Now()
+		if !final && progressShown && now.Before(nextProgress) {
+			return
+		}
+		progressShown = true
+		nextProgress = now.Add(d.config.CCDownloadProgress)
+		d.progressInline("commoncrawl: scanning/importing %s %s%s (lines=%d cz-lines=%d file-new=%d db-total=%d)", label, formatBytes(counting.n), formatDownloadPercent(counting.n, compressedSize), lines, czLines, *total-fileBefore, *total)
+	}
+	report(false)
+	defer func() {
+		if progressShown {
+			d.progress("\n")
+		}
+	}()
 	for scanner.Scan() {
+		if err := ctx.Err(); err != nil {
+			report(true)
+			return hitCZ, passedCZ, err
+		}
+		lines++
 		key := cdxLineKey(scanner.Text())
 		if key >= "cz," && key < "cz-" {
 			hitCZ = true
+			czLines++
 			inserted, err := d.addCDXDomain(ctx, scanner.Text(), block, sink, total)
 			if err != nil {
+				report(true)
 				return hitCZ, passedCZ, err
 			}
 			if inserted && d.config.Limit > 0 && *total >= d.config.Limit {
+				report(true)
 				return hitCZ, passedCZ, errLimitReached
 			}
+			report(false)
 			continue
 		}
 		if hitCZ && key >= "cz-" {
 			passedCZ = true
 			break
 		}
+		report(false)
 	}
 	if err := scanner.Err(); err != nil {
+		report(true)
 		return hitCZ, passedCZ, err
 	}
+	report(true)
 	return hitCZ, passedCZ, nil
 }
 
