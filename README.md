@@ -31,9 +31,9 @@ Use `--fresh` when you explicitly want to delete the previous database and start
 czdomains discover --fresh --limit 10000 --db czdomains.sqlite
 ```
 
-The default discovery source is Common Crawl. `czdomains` reads Common Crawl data files from `data.commoncrawl.org`: it resolves a crawl, downloads `cc-index.paths.gz`, and uses `cluster.idx` when available to fetch only relevant `cdx-*.gz` byte ranges. Sequential CDX streaming is used only for crawls whose manifest does not contain `cluster.idx`; if a present cluster map fails, discovery stops instead of downloading every CDX file.
+The default discovery source is Common Crawl. `czdomains` reads Common Crawl data files from `data.commoncrawl.org`: it resolves a crawl, downloads `cc-index.paths.gz`, and uses `cluster.idx` when available to identify which `cdx-*.gz` files contain `.cz` index data. Those relevant CDX files are downloaded whole, cached locally, and then scanned on disk. Sequential CDX streaming is used only for crawls whose manifest does not contain `cluster.idx`; if a present cluster map fails, discovery stops instead of downloading every CDX file.
 
-Downloaded Common Crawl index maps are cached next to the SQLite database in `.czdomains-cache`. `--fresh` deletes the SQLite database but keeps this cache, so rerunning the same crawl can reuse an already downloaded `cluster.idx`.
+Downloaded Common Crawl index maps and relevant CDX files are cached next to the SQLite database in `.czdomains-cache`. `--fresh` deletes the SQLite database but keeps this cache, so rerunning the same crawl can reuse already downloaded Common Crawl files.
 
 ```sh
 czdomains discover --source commoncrawl --limit 1000
@@ -56,7 +56,7 @@ czdomains discover --cc-fail-threshold 3 --cc-cooldown 15m --cc-wait-progress 1s
 
 `--cc-max-cooldowns 0` means wait indefinitely until the request succeeds or the process is interrupted.
 
-Discovery progress is written to stderr so stdout remains safe for exports and pipelines. Common Crawl discovery reports the crawl-list source, selected crawl IDs, manifest URL, number of CDX files, whether `cluster.idx` is available, scan mode, current block or file, inserted domain counts, retries, cooldowns, and final database totals.
+Discovery progress is written to stderr so stdout remains safe for exports and pipelines. Common Crawl discovery reports the crawl-list source, selected crawl IDs, manifest URL, number of CDX files, whether `cluster.idx` is available, scan mode, current CDX file, inserted domain counts, retries, cooldowns, and final database totals.
 
 You can add `crt.sh`, but it is often rate-limited or temporarily unavailable:
 

@@ -17,15 +17,15 @@ import (
 	"time"
 )
 
-func TestCommonCrawlDiscoveryUsesClusterRangeScan(t *testing.T) {
+func TestCommonCrawlDiscoveryUsesClusterLocalCDXScan(t *testing.T) {
 	cdxPath := "cc-index/collections/CC-MAIN-2026-25/indexes/cdx-00042.gz"
-	cdxBlock := gzipData(t, strings.Join([]string{
+	cdxFile := gzipData(t, strings.Join([]string{
 		`cz,example,mail)/path 20260601000000 {"url":"https://mail.example.cz/path"}`,
 		`cz,seznam,www)/ 20260601000000 {"url":"https://www.seznam.cz/"}`,
 		`com,example)/ 20260601000000 {"url":"https://example.com/"}`,
 	}, "\n")+"\n")
 	manifest := gzipData(t, cdxPath+"\ncc-index/collections/CC-MAIN-2026-25/indexes/cluster.idx\ncc-index/collections/CC-MAIN-2026-25/metadata.yaml\n")
-	var gotRange string
+	cdxRequests := 0
 	var progress bytes.Buffer
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -36,14 +36,13 @@ func TestCommonCrawlDiscoveryUsesClusterRangeScan(t *testing.T) {
 		case "/crawl-data/CC-MAIN-2026-25/cc-index.paths.gz":
 			_, _ = w.Write(manifest)
 		case "/cc-index/collections/CC-MAIN-2026-25/indexes/cluster.idx":
-			_, _ = fmt.Fprintf(w, "cz,example)/ 20260601000000 %s 0 %d 1\nda,example)/ 20260601000000 %s %d 10 2\n", path.Base(cdxPath), len(cdxBlock), path.Base(cdxPath), len(cdxBlock))
+			_, _ = fmt.Fprintf(w, "cz,example)/ 20260601000000 %s 0 100 1\nda,example)/ 20260601000000 %s 100 10 2\n", path.Base(cdxPath), path.Base(cdxPath))
 		case "/" + cdxPath:
-			gotRange = r.Header.Get("Range")
-			if gotRange == "" {
-				t.Errorf("expected Range header")
+			cdxRequests++
+			if gotRange := r.Header.Get("Range"); gotRange != "" {
+				t.Errorf("unexpected Range header %q", gotRange)
 			}
-			w.WriteHeader(http.StatusPartialContent)
-			_, _ = w.Write(cdxBlock)
+			_, _ = w.Write(cdxFile)
 		default:
 			http.NotFound(w, r)
 		}
@@ -65,25 +64,27 @@ func TestCommonCrawlDiscoveryUsesClusterRangeScan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if gotRange != fmt.Sprintf("bytes=0-%d", len(cdxBlock)-1) {
-		t.Fatalf("Range=%q", gotRange)
+	if cdxRequests != 1 {
+		t.Fatalf("cdx requests=%d, want 1", cdxRequests)
 	}
 	if len(got) != 2 || got[0].Domain != "example.cz" || got[1].Domain != "seznam.cz" {
 		t.Fatalf("unexpected domains: %v", got)
 	}
 	out := progress.String()
-	for _, want := range []string{"collinfo.json returned", "manifest has 1 CDX files", "scan mode cluster range scan", "\rcommoncrawl: block 1/1 100.00%"} {
+	for _, want := range []string{"collinfo.json returned", "manifest has 1 CDX files", "scan mode cluster local CDX file scan", "cluster selected 1 CZ candidate block(s) in 1 CDX file(s)", "commoncrawl: file 1/1 100.00% cdx-00042.gz done"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("progress missing %q in:\n%s", want, out)
 		}
 	}
 }
 
-func TestCommonCrawlBlockProgressUsesSingleUpdatingLine(t *testing.T) {
-	cdxPath := "cc-index/collections/CC-MAIN-2026-25/indexes/cdx-00042.gz"
-	firstBlock := gzipData(t, `cz,one)/ 20260601000000 {"url":"https://one.cz/"}`+"\n")
-	secondBlock := gzipData(t, `cz,two)/ 20260601000000 {"url":"https://two.cz/"}`+"\n")
-	manifest := gzipData(t, cdxPath+"\ncc-index/collections/CC-MAIN-2026-25/indexes/cluster.idx\n")
+func TestCommonCrawlClusterScanDownloadsEachCDXFileOnce(t *testing.T) {
+	firstPath := "cc-index/collections/CC-MAIN-2026-25/indexes/cdx-00042.gz"
+	secondPath := "cc-index/collections/CC-MAIN-2026-25/indexes/cdx-00043.gz"
+	firstFile := gzipData(t, `cz,one)/ 20260601000000 {"url":"https://one.cz/"}`+"\n"+`cz,two)/ 20260601000000 {"url":"https://two.cz/"}`+"\n")
+	secondFile := gzipData(t, `cz,three)/ 20260601000000 {"url":"https://three.cz/"}`+"\n")
+	manifest := gzipData(t, firstPath+"\n"+secondPath+"\ncc-index/collections/CC-MAIN-2026-25/indexes/cluster.idx\n")
+	cdxRequests := map[string]int{}
 	var progress bytes.Buffer
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -94,19 +95,19 @@ func TestCommonCrawlBlockProgressUsesSingleUpdatingLine(t *testing.T) {
 		case "/crawl-data/CC-MAIN-2026-25/cc-index.paths.gz":
 			_, _ = w.Write(manifest)
 		case "/cc-index/collections/CC-MAIN-2026-25/indexes/cluster.idx":
-			_, _ = fmt.Fprintf(w, "cz,one)/ 20260601000000 %s 0 %d 1\ncz,two)/ 20260601000000 %s %d %d 2\nda,example)/ 20260601000000 %s %d 10 3\n", path.Base(cdxPath), len(firstBlock), path.Base(cdxPath), len(firstBlock), len(secondBlock), path.Base(cdxPath), len(firstBlock)+len(secondBlock))
-		case "/" + cdxPath:
-			switch r.Header.Get("Range") {
-			case fmt.Sprintf("bytes=0-%d", len(firstBlock)-1):
-				w.WriteHeader(http.StatusPartialContent)
-				_, _ = w.Write(firstBlock)
-			case fmt.Sprintf("bytes=%d-%d", len(firstBlock), len(firstBlock)+len(secondBlock)-1):
-				w.WriteHeader(http.StatusPartialContent)
-				_, _ = w.Write(secondBlock)
-			default:
-				t.Errorf("unexpected Range %q", r.Header.Get("Range"))
-				http.NotFound(w, r)
+			_, _ = fmt.Fprintf(w, "cz,one)/ 20260601000000 %s 0 10 1\ncz,two)/ 20260601000000 %s 10 10 2\ncz,three)/ 20260601000000 %s 20 10 3\nda,example)/ 20260601000000 %s 30 10 4\n", path.Base(firstPath), path.Base(firstPath), path.Base(secondPath), path.Base(secondPath))
+		case "/" + firstPath:
+			if gotRange := r.Header.Get("Range"); gotRange != "" {
+				t.Errorf("unexpected Range header %q", gotRange)
 			}
+			cdxRequests[firstPath]++
+			_, _ = w.Write(firstFile)
+		case "/" + secondPath:
+			if gotRange := r.Header.Get("Range"); gotRange != "" {
+				t.Errorf("unexpected Range header %q", gotRange)
+			}
+			cdxRequests[secondPath]++
+			_, _ = w.Write(secondFile)
 		default:
 			http.NotFound(w, r)
 		}
@@ -127,11 +128,11 @@ func TestCommonCrawlBlockProgressUsesSingleUpdatingLine(t *testing.T) {
 	if _, err := d.Discover(context.Background()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	out := progress.String()
-	if strings.Contains(out, "\ncommoncrawl: block 1/2") || strings.Contains(out, "\ncommoncrawl: block 2/2") {
-		t.Fatalf("block progress should not create one line per block:\n%s", out)
+	if cdxRequests[firstPath] != 1 || cdxRequests[secondPath] != 1 {
+		t.Fatalf("cdx requests=%v, want one request per CDX file", cdxRequests)
 	}
-	for _, want := range []string{"\rcommoncrawl: block 1/2 50.00%", "\rcommoncrawl: block 2/2 100.00%", "\ncommoncrawl: crawl CC-MAIN-2026-25 added"} {
+	out := progress.String()
+	for _, want := range []string{"cluster selected 3 CZ candidate block(s) in 2 CDX file(s)", "commoncrawl: file 1/2 50.00% cdx-00042.gz done", "commoncrawl: file 2/2 100.00% cdx-00043.gz done", "\ncommoncrawl: crawl CC-MAIN-2026-25 added"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("progress missing %q in:\n%s", want, out)
 		}
@@ -140,9 +141,10 @@ func TestCommonCrawlBlockProgressUsesSingleUpdatingLine(t *testing.T) {
 
 func TestCommonCrawlClusterMapUsesCache(t *testing.T) {
 	cdxPath := "cc-index/collections/CC-MAIN-2026-25/indexes/cdx-00042.gz"
-	cdxBlock := gzipData(t, `cz,example)/ 20260601000000 {"url":"https://example.cz/"}`+"\n")
+	cdxFile := gzipData(t, `cz,example)/ 20260601000000 {"url":"https://example.cz/"}`+"\n")
 	manifest := gzipData(t, cdxPath+"\ncc-index/collections/CC-MAIN-2026-25/indexes/cluster.idx\n")
 	clusterRequests := 0
+	cdxRequests := 0
 	var progress bytes.Buffer
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -154,10 +156,10 @@ func TestCommonCrawlClusterMapUsesCache(t *testing.T) {
 			_, _ = w.Write(manifest)
 		case "/cc-index/collections/CC-MAIN-2026-25/indexes/cluster.idx":
 			clusterRequests++
-			_, _ = fmt.Fprintf(w, "cz,example)/ 20260601000000 %s 0 %d 1\nda,example)/ 20260601000000 %s %d 10 2\n", path.Base(cdxPath), len(cdxBlock), path.Base(cdxPath), len(cdxBlock))
+			_, _ = fmt.Fprintf(w, "cz,example)/ 20260601000000 %s 0 10 1\nda,example)/ 20260601000000 %s 10 10 2\n", path.Base(cdxPath), path.Base(cdxPath))
 		case "/" + cdxPath:
-			w.WriteHeader(http.StatusPartialContent)
-			_, _ = w.Write(cdxBlock)
+			cdxRequests++
+			_, _ = w.Write(cdxFile)
 		default:
 			http.NotFound(w, r)
 		}
@@ -188,8 +190,14 @@ func TestCommonCrawlClusterMapUsesCache(t *testing.T) {
 	if clusterRequests != 1 {
 		t.Fatalf("cluster requests after cached second run=%d, want 1", clusterRequests)
 	}
+	if cdxRequests != 1 {
+		t.Fatalf("cdx requests after cached second run=%d, want 1", cdxRequests)
+	}
 	if !strings.Contains(progress.String(), "using cached cluster map") {
 		t.Fatalf("progress missing cached cluster use:\n%s", progress.String())
+	}
+	if !strings.Contains(progress.String(), "using cached CDX file") {
+		t.Fatalf("progress missing cached CDX use:\n%s", progress.String())
 	}
 }
 
@@ -275,7 +283,7 @@ func TestCommonCrawlDoesNotSequentialFallbackAfterClusterFailure(t *testing.T) {
 		CooldownWait:    immediateCooldownWait,
 	})
 	_, err := d.Discover(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "not switching to sequential CDX download") {
+	if err == nil || !strings.Contains(err.Error(), "cluster local CDX file scan failed") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if cdxRequests != 0 {

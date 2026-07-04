@@ -257,12 +257,12 @@ func (d *Discoverer) scanCommonCrawlCrawl(ctx context.Context, crawl ccCrawl, si
 	d.progress("commoncrawl: manifest has %d CDX files, cluster.idx=%t, metadata.yaml=%t\n", len(manifest.CDXPaths), manifest.ClusterPath != "", manifest.MetadataPath != "")
 
 	if manifest.ClusterPath != "" {
-		d.progress("commoncrawl: scan mode cluster range scan\n")
+		d.progress("commoncrawl: scan mode cluster local CDX file scan\n")
 		err := d.scanCommonCrawlWithCluster(ctx, crawl, manifest, sink, total)
 		if err == nil || errors.Is(err, errLimitReached) {
 			return err
 		}
-		return fmt.Errorf("commoncrawl: cluster range scan failed; not switching to sequential CDX download because cluster.idx is present: %w", err)
+		return fmt.Errorf("commoncrawl: cluster local CDX file scan failed: %w", err)
 	}
 
 	d.progress("commoncrawl: scan mode sequential fallback (manifest has no cluster.idx)\n")
@@ -433,30 +433,89 @@ func (d *Discoverer) scanCommonCrawlWithCluster(ctx context.Context, crawl ccCra
 	if err := resolveClusterBlockPaths(blocks, manifest.CDXPaths); err != nil {
 		return err
 	}
-	d.progress("commoncrawl: cluster selected %d CZ candidate block(s)\n", len(blocks))
+	cdxPaths := cdxPathsFromClusterBlocks(blocks)
+	d.progress("commoncrawl: cluster selected %d CZ candidate block(s) in %d CDX file(s)\n", len(blocks), len(cdxPaths))
 	before := *total
-	inlineProgress := false
-	for i, block := range blocks {
-		blockBefore := *total
-		err := d.scanCommonCrawlRangeBlock(ctx, crawl, block, sink, total)
+	for i, cdxPath := range cdxPaths {
+		fileBefore := *total
+		err := d.scanCommonCrawlClusterCDXFile(ctx, crawl, cdxPath, sink, total, i+1, len(cdxPaths), before)
 		if errors.Is(err, errLimitReached) {
-			d.progressInline("commoncrawl: block %d/%d %s %s offset=%d length=%d done (block-new=%d crawl-new=%d db-total=%d)", i+1, len(blocks), formatProgressPercent(i+1, len(blocks)), path.Base(block.IndexPath), block.Offset, block.Length, *total-blockBefore, *total-before, *total)
-			d.progress("\n")
+			d.progress("commoncrawl: file %d/%d %s %s stopped at limit (file-new=%d crawl-new=%d db-total=%d)\n", i+1, len(cdxPaths), formatProgressPercent(i+1, len(cdxPaths)), path.Base(cdxPath), *total-fileBefore, *total-before, *total)
 			return err
 		}
 		if err != nil {
-			if inlineProgress {
-				d.progress("\n")
+			return err
+		}
+		d.progress("commoncrawl: file %d/%d %s %s done (file-new=%d crawl-new=%d db-total=%d)\n", i+1, len(cdxPaths), formatProgressPercent(i+1, len(cdxPaths)), path.Base(cdxPath), *total-fileBefore, *total-before, *total)
+	}
+	return nil
+}
+
+func cdxPathsFromClusterBlocks(blocks []ccClusterBlock) []string {
+	seen := make(map[string]struct{}, len(blocks))
+	paths := make([]string, 0, len(blocks))
+	for _, block := range blocks {
+		if _, ok := seen[block.IndexPath]; ok {
+			continue
+		}
+		seen[block.IndexPath] = struct{}{}
+		paths = append(paths, block.IndexPath)
+	}
+	return paths
+}
+
+func (d *Discoverer) scanCommonCrawlClusterCDXFile(ctx context.Context, crawl ccCrawl, cdxPath string, sink Sink, total *int, fileIndex int, fileCount int, crawlBefore int) error {
+	crawlBlock := CrawlBlock{Source: "commoncrawl", Crawl: crawl.ID, IndexFile: cdxPath, Block: 0}
+	if d.config.BlockTracker != nil {
+		complete, err := d.config.BlockTracker.BlockComplete(ctx, crawlBlock)
+		if err != nil {
+			return err
+		}
+		if complete {
+			d.progress("commoncrawl: skipping completed file %d/%d %s\n", fileIndex, fileCount, path.Base(cdxPath))
+			return nil
+		}
+		if err := d.config.BlockTracker.MarkBlockStarted(ctx, crawlBlock); err != nil {
+			return err
+		}
+	}
+
+	d.progress("commoncrawl: file %d/%d %s %s preparing (crawl-new=%d db-total=%d)\n", fileIndex, fileCount, formatProgressPercent(fileIndex, fileCount), path.Base(cdxPath), *total-crawlBefore, *total)
+	cachePath := d.commonCrawlCDXCachePath(crawl, cdxPath)
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		file, cached, cleanup, err := d.openCommonCrawlCDX(ctx, crawl, cdxPath)
+		if err != nil {
+			if d.config.BlockTracker != nil {
+				_ = d.config.BlockTracker.MarkBlockFailed(ctx, crawlBlock, err)
 			}
 			return err
 		}
-		inlineProgress = true
-		d.progressInline("commoncrawl: block %d/%d %s %s offset=%d length=%d done (block-new=%d crawl-new=%d db-total=%d)", i+1, len(blocks), formatProgressPercent(i+1, len(blocks)), path.Base(block.IndexPath), block.Offset, block.Length, *total-blockBefore, *total-before, *total)
+		_, _, err = d.scanCommonCrawlSequentialGzip(ctx, file, crawlBlock, sink, total)
+		cleanup()
+		if err == nil {
+			if d.config.BlockTracker != nil {
+				if err := d.config.BlockTracker.MarkBlockCompleted(ctx, crawlBlock); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		if errors.Is(err, errLimitReached) {
+			return err
+		}
+		lastErr = err
+		if cached && cachePath != "" {
+			d.progress("commoncrawl: cached CDX file is invalid, deleting %s: %v\n", cachePath, err)
+			_ = os.Remove(cachePath)
+			continue
+		}
+		break
 	}
-	if inlineProgress {
-		d.progress("\n")
+	if d.config.BlockTracker != nil && !errors.Is(lastErr, errLimitReached) {
+		_ = d.config.BlockTracker.MarkBlockFailed(ctx, crawlBlock, lastErr)
 	}
-	return nil
+	return lastErr
 }
 
 func (d *Discoverer) openCommonCrawlCluster(ctx context.Context, crawl ccCrawl, manifest ccManifest, clusterURL string) (*os.File, bool, func(), error) {
@@ -522,6 +581,72 @@ func (d *Discoverer) commonCrawlClusterCachePath(crawl ccCrawl, manifest ccManif
 		return ""
 	}
 	return filepath.Join(cacheDir, "commoncrawl", crawl.ID, path.Base(manifest.ClusterPath))
+}
+
+func (d *Discoverer) openCommonCrawlCDX(ctx context.Context, crawl ccCrawl, cdxPath string) (*os.File, bool, func(), error) {
+	cachePath := d.commonCrawlCDXCachePath(crawl, cdxPath)
+	if cachePath != "" {
+		if stat, err := os.Stat(cachePath); err == nil && stat.Size() > 0 {
+			d.progress("commoncrawl: using cached CDX file %s (%s)\n", cachePath, formatBytes(stat.Size()))
+			file, err := os.Open(cachePath)
+			if err != nil {
+				return nil, false, nil, err
+			}
+			return file, true, func() { _ = file.Close() }, nil
+		}
+		if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
+			return nil, false, nil, err
+		}
+	}
+
+	cdxURL := d.commonCrawlDataURL(cdxPath)
+	cdxFile, err := d.downloadCommonCrawlObjectToTemp(ctx, cdxURL, fmt.Sprintf("CDX %s %s", crawl.ID, path.Base(cdxPath)))
+	if err != nil {
+		return nil, false, nil, err
+	}
+	if _, err := cdxFile.Seek(0, io.SeekStart); err != nil {
+		name := cdxFile.Name()
+		_ = cdxFile.Close()
+		_ = os.Remove(name)
+		return nil, false, nil, err
+	}
+	if cachePath == "" {
+		return cdxFile, false, func() {
+			name := cdxFile.Name()
+			_ = cdxFile.Close()
+			_ = os.Remove(name)
+		}, nil
+	}
+
+	tempName := cdxFile.Name()
+	_ = cdxFile.Close()
+	cacheTmp := fmt.Sprintf("%s.%d.tmp", cachePath, os.Getpid())
+	_ = os.Remove(cacheTmp)
+	if err := moveFile(tempName, cacheTmp); err != nil {
+		_ = os.Remove(tempName)
+		_ = os.Remove(cacheTmp)
+		return nil, false, nil, err
+	}
+	if err := os.Rename(cacheTmp, cachePath); err != nil {
+		_ = os.Remove(cacheTmp)
+		return nil, false, nil, err
+	}
+	if stat, err := os.Stat(cachePath); err == nil {
+		d.progress("commoncrawl: cached CDX file %s (%s)\n", cachePath, formatBytes(stat.Size()))
+	}
+	file, err := os.Open(cachePath)
+	if err != nil {
+		return nil, false, nil, err
+	}
+	return file, false, func() { _ = file.Close() }, nil
+}
+
+func (d *Discoverer) commonCrawlCDXCachePath(crawl ccCrawl, cdxPath string) string {
+	cacheDir := strings.TrimSpace(d.config.CCIndexCacheDir)
+	if cacheDir == "" {
+		return ""
+	}
+	return filepath.Join(cacheDir, "commoncrawl", crawl.ID, "indexes", path.Base(cdxPath))
 }
 
 func moveFile(src string, dst string) error {
@@ -761,45 +886,6 @@ func appendClusterBlock(blocks []ccClusterBlock, block ccClusterBlock) []ccClust
 	return append(blocks, block)
 }
 
-func (d *Discoverer) scanCommonCrawlRangeBlock(ctx context.Context, crawl ccCrawl, block ccClusterBlock, sink Sink, total *int) error {
-	crawlBlock := CrawlBlock{Source: "commoncrawl", Crawl: crawl.ID, IndexFile: block.IndexPath, Block: block.Offset}
-	if d.config.BlockTracker != nil {
-		complete, err := d.config.BlockTracker.BlockComplete(ctx, crawlBlock)
-		if err != nil {
-			return err
-		}
-		if complete {
-			return nil
-		}
-		if err := d.config.BlockTracker.MarkBlockStarted(ctx, crawlBlock); err != nil {
-			return err
-		}
-	}
-
-	rawURL := d.commonCrawlDataURL(block.IndexPath)
-	resp, err := d.getRangeOKWithCooldown(ctx, rawURL, block.Offset, block.Length, "commoncrawl cdx range", fmt.Sprintf("%s:%d", path.Base(block.IndexPath), block.Offset))
-	if err != nil {
-		if d.config.BlockTracker != nil {
-			_ = d.config.BlockTracker.MarkBlockFailed(ctx, crawlBlock, err)
-		}
-		return err
-	}
-	defer resp.Body.Close()
-	err = d.scanCommonCrawlCDXGzip(ctx, resp.Body, crawlBlock, sink, total, true)
-	if err != nil {
-		if d.config.BlockTracker != nil && !errors.Is(err, errLimitReached) {
-			_ = d.config.BlockTracker.MarkBlockFailed(ctx, crawlBlock, err)
-		}
-		return err
-	}
-	if d.config.BlockTracker != nil {
-		if err := d.config.BlockTracker.MarkBlockCompleted(ctx, crawlBlock); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func (d *Discoverer) scanCommonCrawlSequential(ctx context.Context, crawl ccCrawl, cdxPaths []string, sink Sink, total *int) error {
 	before := *total
 	seenCZ := false
@@ -897,30 +983,6 @@ func (d *Discoverer) scanCommonCrawlSequentialGzip(ctx context.Context, r io.Rea
 		return hitCZ, passedCZ, err
 	}
 	return hitCZ, passedCZ, nil
-}
-
-func (d *Discoverer) scanCommonCrawlCDXGzip(ctx context.Context, r io.Reader, block CrawlBlock, sink Sink, total *int, onlyCZ bool) error {
-	gz, err := gzip.NewReader(r)
-	if err != nil {
-		return err
-	}
-	defer gz.Close()
-	scanner := bufio.NewScanner(gz)
-	scanner.Buffer(make([]byte, 0, 64*1024), maxCommonCrawlLineLength)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if onlyCZ && !strings.HasPrefix(line, "cz,") {
-			continue
-		}
-		inserted, err := d.addCDXDomain(ctx, line, block, sink, total)
-		if err != nil {
-			return err
-		}
-		if inserted && d.config.Limit > 0 && *total >= d.config.Limit {
-			return errLimitReached
-		}
-	}
-	return scanner.Err()
 }
 
 func (d *Discoverer) addCDXDomain(ctx context.Context, line string, block CrawlBlock, sink Sink, total *int) (bool, error) {
@@ -1168,38 +1230,6 @@ func (d *Discoverer) getOKWithCooldown(ctx context.Context, rawURL string, label
 	}
 }
 
-func (d *Discoverer) getRangeOKWithCooldown(ctx context.Context, rawURL string, offset int64, length int64, label string, retryLabel string) (*http.Response, error) {
-	var lastErr error
-	transientFailures := 0
-	cooldowns := 0
-	for attempt := 1; ; attempt++ {
-		resp, err := d.doRangeRequest(ctx, rawURL, offset, length, label)
-		if err == nil {
-			return resp, nil
-		}
-		lastErr = err
-		if !isTransientError(err) {
-			return nil, lastErr
-		}
-		cooledDown, cooldownErr := d.cooldownAfterTransient(ctx, retryLabel, err, &transientFailures, &cooldowns)
-		if cooldownErr != nil {
-			return nil, cooldownErr
-		}
-		if cooledDown {
-			attempt = 0
-			continue
-		}
-		if attempt < httpAttempts {
-			d.progress("commoncrawl: retrying %s after transient error: %v\n", retryLabel, err)
-			if err := sleepBeforeRetry(ctx, attempt); err != nil {
-				return nil, err
-			}
-			continue
-		}
-		attempt = 0
-	}
-}
-
 func (d *Discoverer) doRequest(ctx context.Context, rawURL string, label string) (*http.Response, error) {
 	req, err := d.newRequest(ctx, rawURL)
 	if err != nil {
@@ -1210,30 +1240,6 @@ func (d *Discoverer) doRequest(ctx context.Context, rawURL string, label string)
 		return nil, err
 	}
 	if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
-		return resp, nil
-	}
-	statusErr := httpStatusError{
-		label:      label,
-		status:     resp.StatusCode,
-		retryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
-	}
-	if resp.Body != nil {
-		_ = resp.Body.Close()
-	}
-	return nil, statusErr
-}
-
-func (d *Discoverer) doRangeRequest(ctx context.Context, rawURL string, offset int64, length int64, label string) (*http.Response, error) {
-	req, err := d.newRequest(ctx, rawURL)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
-	resp, err := d.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode == http.StatusPartialContent {
 		return resp, nil
 	}
 	statusErr := httpStatusError{
