@@ -237,6 +237,12 @@ func runAll(args []string) error {
 }
 
 func discoverToSQLite(ctx context.Context, dbPath string, outPath string, fresh bool, limit int, sources string, ccIndex string, ccIndexCount int, timeout time.Duration, ccRetry ccRetryOptions) (int, error) {
+	if fresh {
+		fmt.Fprintf(os.Stderr, "fresh: deleting SQLite database files if they exist: %s, %s, %s\n", dbPath, dbPath+"-wal", dbPath+"-shm")
+		if outPath != "" {
+			fmt.Fprintf(os.Stderr, "fresh: truncating output file if it exists: %s\n", outPath)
+		}
+	}
 	store, err := storage.Open(dbPath, storage.Options{Fresh: fresh})
 	if err != nil {
 		return 0, err

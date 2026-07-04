@@ -129,6 +129,7 @@ func TestCommonCrawlFallsBackToSequentialScan(t *testing.T) {
 }
 
 func TestCommonCrawlCrawlLookupFallsBackToHTMLAndSorts(t *testing.T) {
+	cooldowns := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/collinfo.json":
@@ -148,7 +149,10 @@ func TestCommonCrawlCrawlLookupFallsBackToHTMLAndSorts(t *testing.T) {
 		CCCollectionsURL: server.URL + "/collections/index.html",
 		CCFailThreshold:  1,
 		CCMaxCooldowns:   1,
-		CooldownWait:     immediateCooldownWait,
+		CooldownWait: func(context.Context, time.Duration, time.Duration, func(time.Duration)) error {
+			cooldowns++
+			return nil
+		},
 	})
 	got, err := d.commonCrawlCrawls(context.Background())
 	if err != nil {
@@ -156,6 +160,9 @@ func TestCommonCrawlCrawlLookupFallsBackToHTMLAndSorts(t *testing.T) {
 	}
 	if len(got) != 2 || got[0].ID != "CC-MAIN-2026-25" || got[1].ID != "CC-MAIN-2026-21" {
 		t.Fatalf("unexpected crawls: %v", got)
+	}
+	if cooldowns != 0 {
+		t.Fatalf("crawl lookup should fall back without cooldown, cooldowns=%d", cooldowns)
 	}
 }
 

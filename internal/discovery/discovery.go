@@ -306,7 +306,7 @@ func (d *Discoverer) latestCommonCrawlCrawls(ctx context.Context) ([]ccCrawl, er
 }
 
 func (d *Discoverer) commonCrawlCrawlsFromCollInfo(ctx context.Context) ([]ccCrawl, error) {
-	resp, err := d.getOKWithCooldown(ctx, d.config.CollInfoURL, "commoncrawl collinfo", "Common Crawl crawl list")
+	resp, err := d.getOKLimited(ctx, d.config.CollInfoURL, "commoncrawl collinfo", "Common Crawl crawl list")
 	if err != nil {
 		return nil, err
 	}
@@ -330,7 +330,7 @@ func (d *Discoverer) commonCrawlCrawlsFromCollInfo(ctx context.Context) ([]ccCra
 }
 
 func (d *Discoverer) commonCrawlCrawlsFromHTML(ctx context.Context) ([]ccCrawl, error) {
-	resp, err := d.getOKWithCooldown(ctx, d.config.CCCollectionsURL, "commoncrawl collections", "Common Crawl HTML crawl list")
+	resp, err := d.getOKLimited(ctx, d.config.CCCollectionsURL, "commoncrawl collections", "Common Crawl HTML crawl list")
 	if err != nil {
 		return nil, err
 	}
@@ -812,6 +812,27 @@ func (d *Discoverer) getOK(ctx context.Context, rawURL string, label string) (*h
 		}
 		if attempt < httpAttempts {
 			d.progress("commoncrawl: retrying %s after transient error: %v\n", label, err)
+			if err := sleepBeforeRetry(ctx, attempt); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return nil, lastErr
+}
+
+func (d *Discoverer) getOKLimited(ctx context.Context, rawURL string, label string, retryLabel string) (*http.Response, error) {
+	var lastErr error
+	for attempt := 1; attempt <= httpAttempts; attempt++ {
+		resp, err := d.doRequest(ctx, rawURL, label)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		if !isTransientError(err) {
+			return nil, lastErr
+		}
+		if attempt < httpAttempts {
+			d.progress("commoncrawl: retrying %s after transient error: %v\n", retryLabel, err)
 			if err := sleepBeforeRetry(ctx, attempt); err != nil {
 				return nil, err
 			}
