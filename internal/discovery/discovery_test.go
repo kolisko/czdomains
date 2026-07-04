@@ -72,7 +72,66 @@ func TestCommonCrawlDiscoveryUsesClusterRangeScan(t *testing.T) {
 		t.Fatalf("unexpected domains: %v", got)
 	}
 	out := progress.String()
-	for _, want := range []string{"collinfo.json returned", "manifest has 1 CDX files", "scan mode cluster range scan", "block 1/1"} {
+	for _, want := range []string{"collinfo.json returned", "manifest has 1 CDX files", "scan mode cluster range scan", "\rcommoncrawl: block 1/1 100.00%"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("progress missing %q in:\n%s", want, out)
+		}
+	}
+}
+
+func TestCommonCrawlBlockProgressUsesSingleUpdatingLine(t *testing.T) {
+	cdxPath := "cc-index/collections/CC-MAIN-2026-25/indexes/cdx-00042.gz"
+	firstBlock := gzipData(t, `cz,one)/ 20260601000000 {"url":"https://one.cz/"}`+"\n")
+	secondBlock := gzipData(t, `cz,two)/ 20260601000000 {"url":"https://two.cz/"}`+"\n")
+	manifest := gzipData(t, cdxPath+"\ncc-index/collections/CC-MAIN-2026-25/indexes/cluster.idx\n")
+	var progress bytes.Buffer
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/collinfo.json":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[{"id":"CC-MAIN-2026-25"}]`))
+		case "/crawl-data/CC-MAIN-2026-25/cc-index.paths.gz":
+			_, _ = w.Write(manifest)
+		case "/cc-index/collections/CC-MAIN-2026-25/indexes/cluster.idx":
+			_, _ = fmt.Fprintf(w, "cz,one)/ 20260601000000 %s 0 %d 1\ncz,two)/ 20260601000000 %s %d %d 2\nda,example)/ 20260601000000 %s %d 10 3\n", path.Base(cdxPath), len(firstBlock), path.Base(cdxPath), len(firstBlock), len(secondBlock), path.Base(cdxPath), len(firstBlock)+len(secondBlock))
+		case "/" + cdxPath:
+			switch r.Header.Get("Range") {
+			case fmt.Sprintf("bytes=0-%d", len(firstBlock)-1):
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write(firstBlock)
+			case fmt.Sprintf("bytes=%d-%d", len(firstBlock), len(firstBlock)+len(secondBlock)-1):
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write(secondBlock)
+			default:
+				t.Errorf("unexpected Range %q", r.Header.Get("Range"))
+				http.NotFound(w, r)
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	d := New(server.Client(), Config{
+		Limit:           10,
+		CollInfoURL:     server.URL + "/collinfo.json",
+		CCDataBaseURL:   server.URL,
+		CCFailThreshold: 1,
+		CCMaxCooldowns:  1,
+		CooldownWait:    immediateCooldownWait,
+		Progress: func(format string, args ...any) {
+			_, _ = progress.WriteString(formatString(format, args...))
+		},
+	})
+	if _, err := d.Discover(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	out := progress.String()
+	if strings.Contains(out, "\ncommoncrawl: block 1/2") || strings.Contains(out, "\ncommoncrawl: block 2/2") {
+		t.Fatalf("block progress should not create one line per block:\n%s", out)
+	}
+	for _, want := range []string{"\rcommoncrawl: block 1/2 50.00%", "\rcommoncrawl: block 2/2 100.00%", "\ncommoncrawl: crawl CC-MAIN-2026-25 added"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("progress missing %q in:\n%s", want, out)
 		}

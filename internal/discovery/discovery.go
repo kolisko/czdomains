@@ -435,17 +435,26 @@ func (d *Discoverer) scanCommonCrawlWithCluster(ctx context.Context, crawl ccCra
 	}
 	d.progress("commoncrawl: cluster selected %d CZ candidate block(s)\n", len(blocks))
 	before := *total
+	inlineProgress := false
 	for i, block := range blocks {
 		blockBefore := *total
 		err := d.scanCommonCrawlRangeBlock(ctx, crawl, block, sink, total)
 		if errors.Is(err, errLimitReached) {
-			d.progress("commoncrawl: block %d/%d %s offset=%d length=%d done (block-new=%d crawl-new=%d db-total=%d)\n", i+1, len(blocks), path.Base(block.IndexPath), block.Offset, block.Length, *total-blockBefore, *total-before, *total)
+			d.progressInline("commoncrawl: block %d/%d %s %s offset=%d length=%d done (block-new=%d crawl-new=%d db-total=%d)", i+1, len(blocks), formatProgressPercent(i+1, len(blocks)), path.Base(block.IndexPath), block.Offset, block.Length, *total-blockBefore, *total-before, *total)
+			d.progress("\n")
 			return err
 		}
 		if err != nil {
+			if inlineProgress {
+				d.progress("\n")
+			}
 			return err
 		}
-		d.progress("commoncrawl: block %d/%d %s offset=%d length=%d done (block-new=%d crawl-new=%d db-total=%d)\n", i+1, len(blocks), path.Base(block.IndexPath), block.Offset, block.Length, *total-blockBefore, *total-before, *total)
+		inlineProgress = true
+		d.progressInline("commoncrawl: block %d/%d %s %s offset=%d length=%d done (block-new=%d crawl-new=%d db-total=%d)", i+1, len(blocks), formatProgressPercent(i+1, len(blocks)), path.Base(block.IndexPath), block.Offset, block.Length, *total-blockBefore, *total-before, *total)
+	}
+	if inlineProgress {
+		d.progress("\n")
 	}
 	return nil
 }
@@ -760,7 +769,6 @@ func (d *Discoverer) scanCommonCrawlRangeBlock(ctx context.Context, crawl ccCraw
 			return err
 		}
 		if complete {
-			d.progress("commoncrawl: skipping completed block %s offset=%d\n", path.Base(block.IndexPath), block.Offset)
 			return nil
 		}
 		if err := d.config.BlockTracker.MarkBlockStarted(ctx, crawlBlock); err != nil {
@@ -795,6 +803,7 @@ func (d *Discoverer) scanCommonCrawlRangeBlock(ctx context.Context, crawl ccCraw
 func (d *Discoverer) scanCommonCrawlSequential(ctx context.Context, crawl ccCrawl, cdxPaths []string, sink Sink, total *int) error {
 	before := *total
 	seenCZ := false
+	inlineProgress := false
 	for i, cdxPath := range cdxPaths {
 		crawlBlock := CrawlBlock{Source: "commoncrawl", Crawl: crawl.ID, IndexFile: cdxPath, Block: 0}
 		if d.config.BlockTracker != nil {
@@ -812,9 +821,13 @@ func (d *Discoverer) scanCommonCrawlSequential(ctx context.Context, crawl ccCraw
 		}
 
 		fileBefore := *total
-		d.progress("commoncrawl: file %d/%d %s starting (crawl-new=%d db-total=%d)\n", i+1, len(cdxPaths), path.Base(cdxPath), *total-before, *total)
+		d.progressInline("commoncrawl: file %d/%d %s %s starting (crawl-new=%d db-total=%d)", i+1, len(cdxPaths), formatProgressPercent(i+1, len(cdxPaths)), path.Base(cdxPath), *total-before, *total)
+		inlineProgress = true
 		resp, err := d.getOKWithCooldown(ctx, d.commonCrawlDataURL(cdxPath), "commoncrawl cdx", path.Base(cdxPath))
 		if err != nil {
+			if inlineProgress {
+				d.progress("\n")
+			}
 			if d.config.BlockTracker != nil {
 				_ = d.config.BlockTracker.MarkBlockFailed(ctx, crawlBlock, err)
 			}
@@ -823,6 +836,9 @@ func (d *Discoverer) scanCommonCrawlSequential(ctx context.Context, crawl ccCraw
 		hitCZ, passedCZ, scanErr := d.scanCommonCrawlSequentialGzip(ctx, resp.Body, crawlBlock, sink, total)
 		_ = resp.Body.Close()
 		if scanErr != nil {
+			if inlineProgress {
+				d.progress("\n")
+			}
 			if d.config.BlockTracker != nil && !errors.Is(scanErr, errLimitReached) {
 				_ = d.config.BlockTracker.MarkBlockFailed(ctx, crawlBlock, scanErr)
 			}
@@ -836,11 +852,15 @@ func (d *Discoverer) scanCommonCrawlSequential(ctx context.Context, crawl ccCraw
 		if hitCZ {
 			seenCZ = true
 		}
-		d.progress("commoncrawl: file %d/%d %s done (file-new=%d crawl-new=%d db-total=%d)\n", i+1, len(cdxPaths), path.Base(cdxPath), *total-fileBefore, *total-before, *total)
+		d.progressInline("commoncrawl: file %d/%d %s %s done (file-new=%d crawl-new=%d db-total=%d)", i+1, len(cdxPaths), formatProgressPercent(i+1, len(cdxPaths)), path.Base(cdxPath), *total-fileBefore, *total-before, *total)
 		if seenCZ && passedCZ {
+			d.progress("\n")
 			d.progress("commoncrawl: sequential scan passed cz, prefix; stopping after %s\n", path.Base(cdxPath))
 			return nil
 		}
+	}
+	if inlineProgress {
+		d.progress("\n")
 	}
 	return nil
 }
@@ -1448,4 +1468,19 @@ func (d *Discoverer) progress(format string, args ...any) {
 	if d.config.Progress != nil {
 		d.config.Progress(format, args...)
 	}
+}
+
+func (d *Discoverer) progressInline(format string, args ...any) {
+	d.progress("\r"+format+"   ", args...)
+}
+
+func formatProgressPercent(done int, total int) string {
+	if total <= 0 {
+		return "0.00%"
+	}
+	percent := float64(done) * 100 / float64(total)
+	if percent > 100 {
+		percent = 100
+	}
+	return fmt.Sprintf("%.2f%%", percent)
 }
