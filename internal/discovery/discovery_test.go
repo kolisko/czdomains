@@ -2,6 +2,7 @@ package discovery
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
@@ -9,87 +10,38 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
 
-func TestCommonCrawlDiscovery(t *testing.T) {
-	var server *httptest.Server
-	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/collinfo.json":
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`[{"id":"CC-MAIN-TEST","cdx-api":"` + server.URL + `/index"}]`))
-		case "/index":
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"url":"https://www.seznam.cz/"}` + "\n"))
-			_, _ = w.Write([]byte(`{"url":"https://mail.example.cz/path"}` + "\n"))
-			_, _ = w.Write([]byte(`{"url":"https://example.com/"}` + "\n"))
-			_, _ = w.Write([]byte(`{"url":"https://example.cz/again"}` + "\n"))
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
+func TestCommonCrawlDiscoveryUsesClusterRangeScan(t *testing.T) {
+	cdxPath := "cc-index/collections/CC-MAIN-2026-25/indexes/cdx-00042.gz"
+	cdxBlock := gzipData(t, strings.Join([]string{
+		`cz,example,mail)/path 20260601000000 {"url":"https://mail.example.cz/path"}`,
+		`cz,seznam,www)/ 20260601000000 {"url":"https://www.seznam.cz/"}`,
+		`com,example)/ 20260601000000 {"url":"https://example.com/"}`,
+	}, "\n")+"\n")
+	manifest := gzipData(t, cdxPath+"\ncc-index/collections/CC-MAIN-2026-25/indexes/cluster.idx\ncc-index/collections/CC-MAIN-2026-25/metadata.yaml\n")
+	var gotRange string
+	var progress bytes.Buffer
 
-	d := New(server.Client(), Config{
-		Limit:           10,
-		CollInfoURL:     server.URL + "/collinfo.json",
-		CCFailThreshold: 1,
-		CCMaxCooldowns:  1,
-		CooldownWait:    immediateCooldownWait,
-	})
-	got, err := d.Discover(context.Background())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(got) != 2 {
-		t.Fatalf("got %v", got)
-	}
-	if got[0].Domain != "seznam.cz" || got[1].Domain != "example.cz" {
-		t.Fatalf("unexpected domains: %v", got)
-	}
-}
-
-func TestCRTShDiscovery(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`[{"name_value":"*.example.cz\nwww.seznam.cz"}]`))
-	}))
-	defer server.Close()
-
-	d := New(server.Client(), Config{Sources: []string{"crtsh"}, CRTShURL: server.URL, Limit: 10})
-	got, err := d.Discover(context.Background())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(got) != 2 {
-		t.Fatalf("got %v", got)
-	}
-}
-
-func TestCommonCrawlKeepsPartialResultsWhenPageFails(t *testing.T) {
-	var server *httptest.Server
-	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/collinfo.json":
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`[{"id":"CC-MAIN-TEST","cdx-api":"` + server.URL + `/index"}]`))
-		case "/index":
-			if r.URL.Query().Get("showNumPages") == "true" {
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{"pages":2}`))
-				return
+			_, _ = w.Write([]byte(`[{"id":"CC-MAIN-2026-25"},{"id":"CC-MAIN-2026-21"}]`))
+		case "/crawl-data/CC-MAIN-2026-25/cc-index.paths.gz":
+			_, _ = w.Write(manifest)
+		case "/cc-index/collections/CC-MAIN-2026-25/indexes/cluster.idx":
+			_, _ = fmt.Fprintf(w, "cz,example)/ 20260601000000 %s 0 %d 1\nda,example)/ 20260601000000 %s %d 10 2\n", cdxPath, len(cdxBlock), cdxPath, len(cdxBlock))
+		case "/" + cdxPath:
+			gotRange = r.Header.Get("Range")
+			if gotRange == "" {
+				t.Errorf("expected Range header")
 			}
-			if r.URL.Query().Get("page") == "0" {
-				http.Error(w, "bad gateway", http.StatusBadGateway)
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"url":"https://www.seznam.cz/"}` + "\n"))
-			_, _ = w.Write([]byte(`{"url":"https://mail.example.cz/path"}` + "\n"))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(cdxBlock)
 		default:
 			http.NotFound(w, r)
 		}
@@ -99,111 +51,180 @@ func TestCommonCrawlKeepsPartialResultsWhenPageFails(t *testing.T) {
 	d := New(server.Client(), Config{
 		Limit:           10,
 		CollInfoURL:     server.URL + "/collinfo.json",
+		CCDataBaseURL:   server.URL,
 		CCFailThreshold: 1,
 		CCMaxCooldowns:  1,
 		CooldownWait:    immediateCooldownWait,
+		Progress: func(format string, args ...any) {
+			_, _ = progress.WriteString(formatString(format, args...))
+		},
 	})
 	got, err := d.Discover(context.Background())
-	if err == nil {
-		t.Fatal("expected warning error from failed page")
-	}
-	if len(got) != 2 {
-		t.Fatalf("got %v, err %v", got, err)
-	}
-}
-
-func TestCommonCrawlContinuesAcrossIndexesUntilLimit(t *testing.T) {
-	var server *httptest.Server
-	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/collinfo.json":
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`[{"id":"ONE","cdx-api":"` + server.URL + `/one"},{"id":"TWO","cdx-api":"` + server.URL + `/two"}]`))
-		case "/one", "/two":
-			if r.URL.Query().Get("showNumPages") == "true" {
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{"pages":1}`))
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			if r.URL.Path == "/one" {
-				_, _ = w.Write([]byte(`{"url":"https://one.cz/"}` + "\n"))
-				return
-			}
-			_, _ = w.Write([]byte(`{"url":"https://two.cz/"}` + "\n"))
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
-
-	d := New(server.Client(), Config{Limit: 2, CollInfoURL: server.URL + "/collinfo.json", CCIndexCount: 2})
-	got, err := d.Discover(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(got) != 2 {
-		t.Fatalf("got %v", got)
+	if gotRange != fmt.Sprintf("bytes=0-%d", len(cdxBlock)-1) {
+		t.Fatalf("Range=%q", gotRange)
 	}
-	if got[0].Domain != "one.cz" || got[1].Domain != "two.cz" {
+	if len(got) != 2 || got[0].Domain != "example.cz" || got[1].Domain != "seznam.cz" {
 		t.Fatalf("unexpected domains: %v", got)
 	}
+	out := progress.String()
+	for _, want := range []string{"collinfo.json returned", "manifest has 1 CDX files", "scan mode cluster range scan", "block 1/1"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("progress missing %q in:\n%s", want, out)
+		}
+	}
 }
 
-func TestCommonCrawlUsesSamePageSizeForCountAndPageFetch(t *testing.T) {
-	var countPageSize string
-	var fetchPageSize string
-	var server *httptest.Server
-	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func TestCommonCrawlFallsBackToSequentialScan(t *testing.T) {
+	firstPath := "cc-index/collections/CC-MAIN-2026-25/indexes/cdx-00000.gz"
+	secondPath := "cc-index/collections/CC-MAIN-2026-25/indexes/cdx-00001.gz"
+	firstFile := gzipData(t, `am,example)/ 20260601000000 {"url":"https://example.am/"}`+"\n")
+	secondFile := gzipData(t, strings.Join([]string{
+		`cz,example)/ 20260601000000 {"url":"https://example.cz/"}`,
+		`cz,seznam,www)/ 20260601000000 {"url":"https://www.seznam.cz/"}`,
+		`da,example)/ 20260601000000 {"url":"https://example.dk/"}`,
+	}, "\n")+"\n")
+	manifest := gzipData(t, firstPath+"\n"+secondPath+"\n")
+	var progress bytes.Buffer
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/collinfo.json":
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`[{"id":"CC-MAIN-TEST","cdx-api":"` + server.URL + `/index"}]`))
-		case "/index":
-			if r.URL.Query().Get("showNumPages") == "true" {
-				countPageSize = r.URL.Query().Get("pageSize")
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{"pages":1}`))
-				return
-			}
-			fetchPageSize = r.URL.Query().Get("pageSize")
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"url":"https://example.cz/"}` + "\n"))
+			_, _ = w.Write([]byte(`[{"id":"CC-MAIN-2026-25"}]`))
+		case "/crawl-data/CC-MAIN-2026-25/cc-index.paths.gz":
+			_, _ = w.Write(manifest)
+		case "/" + firstPath:
+			_, _ = w.Write(firstFile)
+		case "/" + secondPath:
+			_, _ = w.Write(secondFile)
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer server.Close()
 
-	d := New(server.Client(), Config{Limit: 10, CollInfoURL: server.URL + "/collinfo.json"})
+	d := New(server.Client(), Config{
+		Limit:           10,
+		CollInfoURL:     server.URL + "/collinfo.json",
+		CCDataBaseURL:   server.URL,
+		CCFailThreshold: 1,
+		CCMaxCooldowns:  1,
+		CooldownWait:    immediateCooldownWait,
+		Progress: func(format string, args ...any) {
+			_, _ = progress.WriteString(formatString(format, args...))
+		},
+	})
 	got, err := d.Discover(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(got) != 1 {
-		t.Fatalf("got %v", got)
+	if len(got) != 2 || got[0].Domain != "example.cz" || got[1].Domain != "seznam.cz" {
+		t.Fatalf("unexpected domains: %v", got)
 	}
-	want := strconv.Itoa(commonCrawlPageSize)
-	if countPageSize != want || fetchPageSize != want {
-		t.Fatalf("count pageSize=%q fetch pageSize=%q want %q", countPageSize, fetchPageSize, want)
-	}
-	if commonCrawlPageSize != 5 {
-		t.Fatalf("commonCrawlPageSize=%d, want 5 for checkpoint compatibility", commonCrawlPageSize)
+	if !strings.Contains(progress.String(), "scan mode sequential fallback") {
+		t.Fatalf("progress missing fallback mode:\n%s", progress.String())
 	}
 }
 
-func TestCommonCrawlCooldownRetriesSamePageAfterThreeTransientFailures(t *testing.T) {
+func TestCommonCrawlCrawlLookupFallsBackToHTMLAndSorts(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/collinfo.json":
+			http.Error(w, "nope", http.StatusInternalServerError)
+		case "/collections/index.html":
+			_, _ = w.Write([]byte(`<a>CC-MAIN-2025-51</a><a>CC-MAIN-2026-21</a><a>CC-MAIN-2026-25</a><a>CC-MAIN-2026-25</a>`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	d := New(server.Client(), Config{
+		CCIndex:          "latest",
+		CCIndexCount:     2,
+		CollInfoURL:      server.URL + "/collinfo.json",
+		CCCollectionsURL: server.URL + "/collections/index.html",
+		CCFailThreshold:  1,
+		CCMaxCooldowns:   1,
+		CooldownWait:     immediateCooldownWait,
+	})
+	got, err := d.commonCrawlCrawls(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].ID != "CC-MAIN-2026-25" || got[1].ID != "CC-MAIN-2026-21" {
+		t.Fatalf("unexpected crawls: %v", got)
+	}
+}
+
+func TestCommonCrawlRejectsOldIndexEndpoint(t *testing.T) {
+	d := New(nil, Config{CCIndex: "https://index.commoncrawl.org/CC-MAIN-2026-25-index"})
+	_, err := d.commonCrawlCrawls(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "must be latest or a crawl id") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestParseCommonCrawlManifest(t *testing.T) {
+	manifest, err := parseCommonCrawlManifest(strings.NewReader(strings.Join([]string{
+		"cc-index/collections/CC-MAIN-2026-25/indexes/cdx-00000.gz",
+		"cc-index/collections/CC-MAIN-2026-25/indexes/cdx-00001.gz",
+		"cc-index/collections/CC-MAIN-2026-25/indexes/cluster.idx",
+		"cc-index/collections/CC-MAIN-2026-25/metadata.yaml",
+	}, "\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.CDXPaths) != 2 || manifest.ClusterPath == "" || manifest.MetadataPath == "" {
+		t.Fatalf("unexpected manifest: %+v", manifest)
+	}
+}
+
+func TestParseCommonCrawlManifestRequiresCDX(t *testing.T) {
+	_, err := parseCommonCrawlManifest(strings.NewReader("cc-index/collections/CC-MAIN-2026-25/indexes/cluster.idx\n"))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestDomainFromCDXKey(t *testing.T) {
+	cases := []struct {
+		key  string
+		want string
+		ok   bool
+	}{
+		{key: "cz,seznam)/", want: "seznam.cz", ok: true},
+		{key: "cz,seznam,www)/path", want: "seznam.cz", ok: true},
+		{key: "com,example)/", ok: false},
+		{key: "cz,)/", ok: false},
+		{key: "cz,exa_mple)/", ok: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.key, func(t *testing.T) {
+			got, err := domainFromCDXKey(tc.key)
+			if tc.ok && (err != nil || got != tc.want) {
+				t.Fatalf("domainFromCDXKey=%q,%v want %q", got, err, tc.want)
+			}
+			if !tc.ok && err == nil {
+				t.Fatalf("expected error, got %q", got)
+			}
+		})
+	}
+}
+
+func TestCommonCrawlCooldownRetriesAfterThreeTransientFailures(t *testing.T) {
 	client := &sequenceClient{
 		responses: []sequenceResponse{
 			{err: io.EOF},
 			{err: io.ErrUnexpectedEOF},
 			{err: errors.New("dial tcp: connect: connection refused")},
-			{status: http.StatusOK, body: `{"url":"https://example.cz/"}` + "\n"},
+			{status: http.StatusOK, body: "ok"},
 		},
 	}
 	cooldowns := 0
 	d := New(client, Config{
-		Limit:           10,
 		CCFailThreshold: 3,
 		CooldownWait: func(ctx context.Context, duration time.Duration, progressEvery time.Duration, onProgress func(time.Duration)) error {
 			cooldowns++
@@ -211,17 +232,13 @@ func TestCommonCrawlCooldownRetriesSamePageAfterThreeTransientFailures(t *testin
 			return nil
 		},
 	})
-	sink := newMemorySink()
-	total := 0
-	err := d.scanCommonCrawlPage(context.Background(), CrawlPage{Source: "commoncrawl", IndexURL: "test", Page: 0}, "page 1/1", "https://example.test/index", sink, &total)
+	resp, err := d.getOKWithCooldown(context.Background(), "https://example.test/index", "commoncrawl", "test request")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	_ = resp.Body.Close()
 	if cooldowns != 1 {
 		t.Fatalf("cooldowns=%d, want 1", cooldowns)
-	}
-	if total != 1 || len(sink.Results()) != 1 || sink.Results()[0].Domain != "example.cz" {
-		t.Fatalf("unexpected results total=%d results=%v", total, sink.Results())
 	}
 	if client.calls != 4 {
 		t.Fatalf("client calls=%d, want 4", client.calls)
@@ -264,7 +281,7 @@ func TestCommonCrawlRetryAfterOverridesDefaultCooldown(t *testing.T) {
 	})
 	failures := 0
 	cooldowns := 0
-	cooledDown, err := d.cooldownAfterTransient(context.Background(), "page 1/1", httpStatusError{
+	cooledDown, err := d.cooldownAfterTransient(context.Background(), "request", httpStatusError{
 		label:      "commoncrawl",
 		status:     http.StatusServiceUnavailable,
 		retryAfter: 2 * time.Minute,
@@ -294,7 +311,7 @@ func TestCommonCrawlWaitingProgressUsesCarriageReturnAndFinalNewline(t *testing.
 	})
 	failures := 0
 	cooldowns := 0
-	cooledDown, err := d.cooldownAfterTransient(context.Background(), "page 1/1", io.EOF, &failures, &cooldowns)
+	cooledDown, err := d.cooldownAfterTransient(context.Background(), "request", io.EOF, &failures, &cooldowns)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -302,12 +319,42 @@ func TestCommonCrawlWaitingProgressUsesCarriageReturnAndFinalNewline(t *testing.
 		t.Fatal("expected cooldown")
 	}
 	got := progress.String()
-	if !strings.Contains(got, "\rcommoncrawl: waiting 42s before retrying page 1/1") {
+	if !strings.Contains(got, "\rcommoncrawl: waiting 42s before retrying request") {
 		t.Fatalf("progress does not contain carriage-return countdown: %q", got)
 	}
-	if !strings.Contains(got, "\rcommoncrawl: retrying page 1/1 after cooldown\n") {
+	if !strings.Contains(got, "\rcommoncrawl: retrying request after cooldown\n") {
 		t.Fatalf("progress does not finish line before retry: %q", got)
 	}
+}
+
+func TestCRTShDiscovery(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"name_value":"*.example.cz\nwww.seznam.cz"}]`))
+	}))
+	defer server.Close()
+
+	d := New(server.Client(), Config{Sources: []string{"crtsh"}, CRTShURL: server.URL, Limit: 10})
+	got, err := d.Discover(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func gzipData(t *testing.T, value string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w := gzip.NewWriter(&buf)
+	if _, err := w.Write([]byte(value)); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
 }
 
 func immediateCooldownWait(context.Context, time.Duration, time.Duration, func(time.Duration)) error {

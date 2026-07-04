@@ -2,6 +2,7 @@ package discovery
 
 import (
 	"bufio"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,9 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"path"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -18,15 +22,15 @@ import (
 )
 
 const (
-	DefaultCollInfoURL = "https://index.commoncrawl.org/collinfo.json"
-	DefaultCRTShURL    = "https://crt.sh/"
-
-	httpAttempts        = 3
-	commonCrawlPageSize = 5
-
-	DefaultCCFailThreshold = 3
-	DefaultCCCooldown      = 15 * time.Minute
-	DefaultCCWaitProgress  = time.Second
+	DefaultCollInfoURL       = "https://index.commoncrawl.org/collinfo.json"
+	DefaultCCCollectionsURL  = "https://data.commoncrawl.org/cc-index/collections/index.html"
+	DefaultCCDataBaseURL     = "https://data.commoncrawl.org/"
+	DefaultCRTShURL          = "https://crt.sh/"
+	httpAttempts             = 3
+	DefaultCCFailThreshold   = 3
+	DefaultCCCooldown        = 15 * time.Minute
+	DefaultCCWaitProgress    = time.Second
+	maxCommonCrawlLineLength = 8 * 1024 * 1024
 )
 
 type HTTPClient interface {
@@ -36,16 +40,18 @@ type HTTPClient interface {
 type CooldownWaitFunc func(ctx context.Context, duration time.Duration, progressEvery time.Duration, onProgress func(time.Duration)) error
 
 type Config struct {
-	Limit        int
-	Sources      []string
-	CCIndex      string
-	CollInfoURL  string
-	CRTShURL     string
-	UserAgent    string
-	Delay        time.Duration
-	CCIndexCount int
-	PageTracker  PageTracker
-	Progress     func(format string, args ...any)
+	Limit            int
+	Sources          []string
+	CCIndex          string
+	CCIndexCount     int
+	CollInfoURL      string
+	CCCollectionsURL string
+	CCDataBaseURL    string
+	CRTShURL         string
+	UserAgent        string
+	Delay            time.Duration
+	BlockTracker     BlockTracker
+	Progress         func(format string, args ...any)
 
 	CCFailThreshold int
 	CCCooldown      time.Duration
@@ -60,16 +66,17 @@ type Result struct {
 }
 
 type FoundDomain struct {
-	Domain   string
-	Source   string
-	IndexURL string
-	Page     int
+	Domain    string
+	Source    string
+	IndexFile string
+	Block     int64
 }
 
-type CrawlPage struct {
-	Source   string
-	IndexURL string
-	Page     int
+type CrawlBlock struct {
+	Source    string
+	Crawl     string
+	IndexFile string
+	Block     int64
 }
 
 type Sink interface {
@@ -77,11 +84,11 @@ type Sink interface {
 	Count(ctx context.Context) (int, error)
 }
 
-type PageTracker interface {
-	PageComplete(ctx context.Context, page CrawlPage) (bool, error)
-	MarkPageStarted(ctx context.Context, page CrawlPage) error
-	MarkPageCompleted(ctx context.Context, page CrawlPage) error
-	MarkPageFailed(ctx context.Context, page CrawlPage, err error) error
+type BlockTracker interface {
+	BlockComplete(ctx context.Context, block CrawlBlock) (bool, error)
+	MarkBlockStarted(ctx context.Context, block CrawlBlock) error
+	MarkBlockCompleted(ctx context.Context, block CrawlBlock) error
+	MarkBlockFailed(ctx context.Context, block CrawlBlock, err error) error
 }
 
 type Discoverer struct {
@@ -89,7 +96,28 @@ type Discoverer struct {
 	config Config
 }
 
-var errLimitReached = errors.New("discovery limit reached")
+type ccCrawl struct {
+	ID string
+}
+
+type ccManifest struct {
+	CDXPaths     []string
+	ClusterPath string
+	MetadataPath string
+}
+
+type ccClusterBlock struct {
+	Key       string
+	IndexPath string
+	Offset    int64
+	Length    int64
+}
+
+var (
+	errLimitReached      = errors.New("discovery limit reached")
+	crawlIDPattern       = regexp.MustCompile(`CC-MAIN-(?:\d{4}-\d{4}|\d{4}-\d{2}|\d{4})`)
+	crawlIDSortKeyRegexp = regexp.MustCompile(`^CC-MAIN-(\d{4})(?:-(\d{2,4}))?$`)
+)
 
 func New(client HTTPClient, config Config) *Discoverer {
 	if client == nil {
@@ -97,6 +125,12 @@ func New(client HTTPClient, config Config) *Discoverer {
 	}
 	if config.CollInfoURL == "" {
 		config.CollInfoURL = DefaultCollInfoURL
+	}
+	if config.CCCollectionsURL == "" {
+		config.CCCollectionsURL = DefaultCCCollectionsURL
+	}
+	if config.CCDataBaseURL == "" {
+		config.CCDataBaseURL = DefaultCCDataBaseURL
 	}
 	if config.CRTShURL == "" {
 		config.CRTShURL = DefaultCRTShURL
@@ -164,13 +198,8 @@ func (d *Discoverer) DiscoverTo(ctx context.Context, sink Sink) error {
 	return errors.Join(errs...)
 }
 
-type ccIndex struct {
-	ID     string `json:"id"`
-	CDXAPI string `json:"cdx-api"`
-}
-
 func (d *Discoverer) discoverCommonCrawl(ctx context.Context, sink Sink) error {
-	indexURLs, err := d.commonCrawlIndexURLs(ctx)
+	crawls, err := d.commonCrawlCrawls(ctx)
 	if err != nil {
 		return err
 	}
@@ -182,254 +211,526 @@ func (d *Discoverer) discoverCommonCrawl(ctx context.Context, sink Sink) error {
 	if d.config.Limit > 0 && total >= d.config.Limit {
 		return nil
 	}
+
+	d.progress("commoncrawl: selected %d crawl(s): %s\n", len(crawls), crawlIDs(crawls))
 	var errs []error
-	for _, indexURL := range indexURLs {
-		d.progress("commoncrawl: scanning %s (%d unique domains so far)\n", indexURL, total)
-		pageCount, err := d.commonCrawlPageCount(ctx, indexURL)
+	for i, crawl := range crawls {
+		before := total
+		d.progress("commoncrawl: crawl %d/%d %s starting (%d domains in database)\n", i+1, len(crawls), crawl.ID, total)
+		err := d.scanCommonCrawlCrawl(ctx, crawl, sink, &total)
+		if errors.Is(err, errLimitReached) {
+			d.progress("commoncrawl: limit reached after %s; crawl added %d unique domains\n", crawl.ID, total-before)
+			return errors.Join(errs...)
+		}
 		if err != nil {
-			d.progress("commoncrawl: page count failed for %s: %v\n", indexURL, err)
+			d.progress("commoncrawl: crawl %s completed with warning: %v\n", crawl.ID, err)
 			errs = append(errs, err)
-			pageCount = 0
 		}
-
-		beforeIndex := total
-		if pageCount == 0 {
-			page := CrawlPage{Source: "commoncrawl", IndexURL: indexURL, Page: -1}
-			err := d.scanCommonCrawlPage(ctx, page, "index scan", commonCrawlQuery(indexURL, -1, commonCrawlRawLimit(d.config.Limit)), sink, &total)
-			if errors.Is(err, errLimitReached) {
-				return errors.Join(errs...)
-			}
-			if err != nil {
-				d.progress("commoncrawl: scan failed for %s: %v\n", indexURL, err)
-				errs = append(errs, err)
-			}
-			d.progress("commoncrawl: index added %d unique domains\n", total-beforeIndex)
-			continue
-		}
-
-		for page := 0; page < pageCount; page++ {
-			crawlPage := CrawlPage{Source: "commoncrawl", IndexURL: indexURL, Page: page}
-			retryLabel := fmt.Sprintf("page %d/%d", page+1, pageCount)
-			err := d.scanCommonCrawlPage(ctx, crawlPage, retryLabel, commonCrawlQuery(indexURL, page, 0), sink, &total)
-			if errors.Is(err, errLimitReached) {
-				return errors.Join(errs...)
-			}
-			if err != nil {
-				d.progress("commoncrawl: page %d/%d failed for %s: %v\n", page+1, pageCount, indexURL, err)
-				errs = append(errs, err)
-				continue
-			}
-			d.progress("commoncrawl: page %d/%d, %d unique domains\n", page+1, pageCount, total)
-		}
-		d.progress("commoncrawl: index added %d unique domains\n", total-beforeIndex)
+		d.progress("commoncrawl: crawl %s added %d unique domains (%d total)\n", crawl.ID, total-before, total)
 	}
 
 	return errors.Join(errs...)
 }
 
-func commonCrawlQuery(indexURL string, page int, limit int) string {
-	query, err := url.Parse(indexURL)
+func (d *Discoverer) scanCommonCrawlCrawl(ctx context.Context, crawl ccCrawl, sink Sink, total *int) error {
+	manifestURL := d.commonCrawlDataURL(fmt.Sprintf("crawl-data/%s/cc-index.paths.gz", crawl.ID))
+	d.progress("commoncrawl: downloading manifest %s\n", manifestURL)
+	manifest, err := d.fetchCommonCrawlManifest(ctx, manifestURL)
 	if err != nil {
-		return indexURL
+		return err
 	}
-	values := query.Query()
-	values.Set("url", "*.cz/")
-	values.Set("output", "json")
-	values.Set("fl", "url")
-	if page >= 0 {
-		values.Set("page", fmt.Sprintf("%d", page))
-		values.Set("pageSize", fmt.Sprintf("%d", commonCrawlPageSize))
+	d.progress("commoncrawl: manifest has %d CDX files, cluster.idx=%t, metadata.yaml=%t\n", len(manifest.CDXPaths), manifest.ClusterPath != "", manifest.MetadataPath != "")
+
+	if manifest.ClusterPath != "" {
+		d.progress("commoncrawl: scan mode cluster range scan\n")
+		err := d.scanCommonCrawlWithCluster(ctx, crawl, manifest, sink, total)
+		if err == nil || errors.Is(err, errLimitReached) {
+			return err
+		}
+		d.progress("commoncrawl: cluster range scan failed, switching to sequential fallback: %v\n", err)
 	}
-	if limit > 0 {
-		values.Set("limit", fmt.Sprintf("%d", limit))
-	}
-	query.RawQuery = values.Encode()
-	return query.String()
+
+	d.progress("commoncrawl: scan mode sequential fallback\n")
+	return d.scanCommonCrawlSequential(ctx, crawl, manifest.CDXPaths, sink, total)
 }
 
-type ccPageInfo struct {
-	Pages int `json:"pages"`
-}
-
-func (d *Discoverer) commonCrawlPageCount(ctx context.Context, indexURL string) (int, error) {
-	query, err := url.Parse(indexURL)
+func (d *Discoverer) commonCrawlCrawls(ctx context.Context) ([]ccCrawl, error) {
+	index := strings.TrimSpace(d.config.CCIndex)
+	if index == "" || strings.EqualFold(index, "latest") {
+		return d.latestCommonCrawlCrawls(ctx)
+	}
+	if strings.HasPrefix(index, "http://") || strings.HasPrefix(index, "https://") || strings.HasSuffix(index, "-index") {
+		return nil, fmt.Errorf("commoncrawl: --cc-index must be latest or a crawl id like CC-MAIN-2026-25, not %q", index)
+	}
+	if !crawlIDPattern.MatchString(index) || crawlIDPattern.FindString(index) != index {
+		return nil, fmt.Errorf("commoncrawl: invalid crawl id %q", index)
+	}
+	manifestURL := d.commonCrawlDataURL(fmt.Sprintf("crawl-data/%s/cc-index.paths.gz", index))
+	d.progress("commoncrawl: verifying explicit crawl %s via %s\n", index, manifestURL)
+	resp, err := d.getOKWithCooldown(ctx, manifestURL, "commoncrawl manifest verification", fmt.Sprintf("manifest %s", index))
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	values := query.Query()
-	values.Set("url", "*.cz/")
-	values.Set("showNumPages", "true")
-	values.Set("pageSize", fmt.Sprintf("%d", commonCrawlPageSize))
-	query.RawQuery = values.Encode()
-
-	var lastErr error
-	for attempt := 1; attempt <= httpAttempts; attempt++ {
-		resp, err := d.getOKWithCooldown(ctx, query.String(), "commoncrawl page count", "Common Crawl page count")
-		if err != nil {
-			return 0, err
-		}
-		var info ccPageInfo
-		err = json.NewDecoder(resp.Body).Decode(&info)
-		_ = resp.Body.Close()
-		if err == nil {
-			return info.Pages, nil
-		}
-		lastErr = err
-		if attempt < httpAttempts {
-			if err := sleepBeforeRetry(ctx, attempt); err != nil {
-				return 0, err
-			}
-		}
-	}
-	return 0, lastErr
+	_ = resp.Body.Close()
+	return []ccCrawl{{ID: index}}, nil
 }
 
-func (d *Discoverer) scanCommonCrawlPage(ctx context.Context, page CrawlPage, retryLabel string, rawURL string, sink Sink, total *int) error {
-	if d.config.PageTracker != nil {
-		complete, err := d.config.PageTracker.PageComplete(ctx, page)
+func (d *Discoverer) latestCommonCrawlCrawls(ctx context.Context) ([]ccCrawl, error) {
+	d.progress("commoncrawl: looking up crawls via collinfo.json %s\n", d.config.CollInfoURL)
+	crawls, err := d.commonCrawlCrawlsFromCollInfo(ctx)
+	if err != nil {
+		d.progress("commoncrawl: collinfo.json lookup failed: %v\n", err)
+		d.progress("commoncrawl: falling back to data HTML index %s\n", d.config.CCCollectionsURL)
+		crawls, err = d.commonCrawlCrawlsFromHTML(ctx)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		if complete {
-			d.progress("commoncrawl: skipping completed page %d for %s\n", page.Page, page.IndexURL)
-			return nil
-		}
-		if err := d.config.PageTracker.MarkPageStarted(ctx, page); err != nil {
-			return err
-		}
+	} else {
+		d.progress("commoncrawl: collinfo.json returned %d crawl(s)\n", len(crawls))
 	}
-
-	var lastErr error
-	transientFailures := 0
-	cooldowns := 0
-	for attempt := 1; ; attempt++ {
-		resp, err := d.getOKWithCooldown(ctx, rawURL, "commoncrawl", retryLabel)
-		if err != nil {
-			lastErr = err
-			break
-		}
-		scanner := bufio.NewScanner(resp.Body)
-		scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
-		for scanner.Scan() {
-			var row struct {
-				URL string `json:"url"`
-			}
-			if err := json.Unmarshal(scanner.Bytes(), &row); err != nil || row.URL == "" {
-				continue
-			}
-			domain, err := domainutil.FromURL(row.URL)
-			if err != nil {
-				continue
-			}
-			inserted, err := sink.AddDomain(ctx, FoundDomain{
-				Domain:   domain,
-				Source:   "commoncrawl",
-				IndexURL: page.IndexURL,
-				Page:     page.Page,
-			})
-			if err != nil {
-				_ = resp.Body.Close()
-				return err
-			}
-			if inserted {
-				(*total)++
-				if d.config.Limit > 0 && *total >= d.config.Limit {
-					_ = resp.Body.Close()
-					return errLimitReached
-				}
-			}
-		}
-		err = scanner.Err()
-		_ = resp.Body.Close()
-		if err == nil {
-			if d.config.PageTracker != nil {
-				if err := d.config.PageTracker.MarkPageCompleted(ctx, page); err != nil {
-					return err
-				}
-			}
-			return nil
-		}
-		lastErr = err
-		if !isTransientError(err) {
-			break
-		}
-		cooledDown, cooldownErr := d.cooldownAfterTransient(ctx, retryLabel, err, &transientFailures, &cooldowns)
-		if cooldownErr != nil {
-			lastErr = cooldownErr
-			break
-		}
-		if cooledDown {
-			attempt = 0
-			continue
-		}
-		if attempt < httpAttempts {
-			if err := sleepBeforeRetry(ctx, attempt); err != nil {
-				return err
-			}
-			continue
-		}
-		attempt = 0
+	sortCrawls(crawls)
+	limit := d.config.CCIndexCount
+	if limit < 0 {
+		limit = 0
 	}
-	if d.config.PageTracker != nil && lastErr != nil {
-		if err := d.config.PageTracker.MarkPageFailed(ctx, page, lastErr); err != nil {
-			return err
-		}
+	if limit == 0 {
+		limit = 1
 	}
-	return lastErr
+	if limit < len(crawls) {
+		crawls = crawls[:limit]
+	}
+	if len(crawls) == 0 {
+		return nil, errors.New("commoncrawl: no crawls found")
+	}
+	return crawls, nil
 }
 
-func commonCrawlRawLimit(uniqueLimit int) int {
-	if uniqueLimit <= 0 {
-		return 0
-	}
-	rawLimit := uniqueLimit * 50
-	if rawLimit < 1000 {
-		rawLimit = 1000
-	}
-	if rawLimit > 200000 {
-		rawLimit = 200000
-	}
-	return rawLimit
-}
-
-func (d *Discoverer) commonCrawlIndexURLs(ctx context.Context) ([]string, error) {
-	if d.config.CCIndex != "" && d.config.CCIndex != "latest" {
-		if strings.HasPrefix(d.config.CCIndex, "http://") || strings.HasPrefix(d.config.CCIndex, "https://") {
-			return []string{d.config.CCIndex}, nil
-		}
-		return []string{fmt.Sprintf("https://index.commoncrawl.org/%s-index", d.config.CCIndex)}, nil
-	}
-
-	resp, err := d.getOKWithCooldown(ctx, d.config.CollInfoURL, "commoncrawl collinfo", "Common Crawl index list")
+func (d *Discoverer) commonCrawlCrawlsFromCollInfo(ctx context.Context) ([]ccCrawl, error) {
+	resp, err := d.getOKWithCooldown(ctx, d.config.CollInfoURL, "commoncrawl collinfo", "Common Crawl crawl list")
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-
-	var indexes []ccIndex
-	if err := json.NewDecoder(resp.Body).Decode(&indexes); err != nil {
+	var rows []struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rows); err != nil {
 		return nil, err
 	}
-	indexLimit := d.config.CCIndexCount
-	if indexLimit < 0 {
-		indexLimit = 0
-	}
-	if indexLimit == 0 {
-		indexLimit = len(indexes)
-	}
-	indexURLs := make([]string, 0, indexLimit)
-	for _, index := range indexes {
-		if index.CDXAPI != "" {
-			indexURLs = append(indexURLs, index.CDXAPI)
-			if len(indexURLs) >= indexLimit {
-				break
-			}
+	crawls := make([]ccCrawl, 0, len(rows))
+	for _, row := range rows {
+		if row.ID != "" && crawlIDPattern.FindString(row.ID) == row.ID {
+			crawls = append(crawls, ccCrawl{ID: row.ID})
 		}
 	}
-	if len(indexURLs) == 0 {
-		return nil, errors.New("commoncrawl collinfo did not contain a cdx-api endpoint")
+	if len(crawls) == 0 {
+		return nil, errors.New("commoncrawl: collinfo.json did not contain crawl ids")
 	}
-	return indexURLs, nil
+	return dedupeCrawls(crawls), nil
+}
+
+func (d *Discoverer) commonCrawlCrawlsFromHTML(ctx context.Context) ([]ccCrawl, error) {
+	resp, err := d.getOKWithCooldown(ctx, d.config.CCCollectionsURL, "commoncrawl collections", "Common Crawl HTML crawl list")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8*1024*1024))
+	if err != nil {
+		return nil, err
+	}
+	matches := crawlIDPattern.FindAllString(string(body), -1)
+	crawls := make([]ccCrawl, 0, len(matches))
+	for _, match := range matches {
+		crawls = append(crawls, ccCrawl{ID: match})
+	}
+	if len(crawls) == 0 {
+		return nil, errors.New("commoncrawl: HTML crawl list did not contain crawl ids")
+	}
+	crawls = dedupeCrawls(crawls)
+	d.progress("commoncrawl: HTML crawl list returned %d crawl(s)\n", len(crawls))
+	return crawls, nil
+}
+
+func (d *Discoverer) fetchCommonCrawlManifest(ctx context.Context, manifestURL string) (ccManifest, error) {
+	resp, err := d.getOKWithCooldown(ctx, manifestURL, "commoncrawl manifest", path.Base(manifestURL))
+	if err != nil {
+		return ccManifest{}, err
+	}
+	defer resp.Body.Close()
+	gz, err := gzip.NewReader(resp.Body)
+	if err != nil {
+		return ccManifest{}, err
+	}
+	defer gz.Close()
+	return parseCommonCrawlManifest(gz)
+}
+
+func parseCommonCrawlManifest(r io.Reader) (ccManifest, error) {
+	var manifest ccManifest
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxCommonCrawlLineLength)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		switch {
+		case strings.Contains(line, "indexes/cdx-") && strings.HasSuffix(line, ".gz"):
+			manifest.CDXPaths = append(manifest.CDXPaths, line)
+		case strings.HasSuffix(line, "/indexes/cluster.idx"):
+			manifest.ClusterPath = line
+		case strings.HasSuffix(line, "/metadata.yaml"):
+			manifest.MetadataPath = line
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return ccManifest{}, err
+	}
+	if len(manifest.CDXPaths) == 0 {
+		return ccManifest{}, errors.New("commoncrawl: manifest did not contain any cdx-*.gz files")
+	}
+	return manifest, nil
+}
+
+func (d *Discoverer) scanCommonCrawlWithCluster(ctx context.Context, crawl ccCrawl, manifest ccManifest, sink Sink, total *int) error {
+	clusterURL := d.commonCrawlDataURL(manifest.ClusterPath)
+	d.progress("commoncrawl: downloading cluster map %s\n", clusterURL)
+	resp, err := d.getOKWithCooldown(ctx, clusterURL, "commoncrawl cluster", fmt.Sprintf("cluster.idx %s", crawl.ID))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	blocks, err := parseCommonCrawlCluster(resp.Body)
+	if err != nil {
+		return err
+	}
+	if len(blocks) == 0 {
+		return errors.New("commoncrawl: cluster.idx did not contain cz blocks")
+	}
+	d.progress("commoncrawl: cluster selected %d CZ candidate block(s)\n", len(blocks))
+	before := *total
+	for i, block := range blocks {
+		d.progress("commoncrawl: block %d/%d %s offset=%d length=%d (%d new, %d total)\n", i+1, len(blocks), path.Base(block.IndexPath), block.Offset, block.Length, *total-before, *total)
+		err := d.scanCommonCrawlRangeBlock(ctx, crawl, block, sink, total)
+		if errors.Is(err, errLimitReached) {
+			return err
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func parseCommonCrawlCluster(r io.Reader) ([]ccClusterBlock, error) {
+	var blocks []ccClusterBlock
+	var previous *ccClusterBlock
+	inCZRange := false
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxCommonCrawlLineLength)
+	for scanner.Scan() {
+		block, ok := parseClusterLine(scanner.Text())
+		if !ok {
+			continue
+		}
+		if block.Key >= "cz," && block.Key < "cz-" {
+			if !inCZRange && previous != nil {
+				blocks = appendClusterBlock(blocks, *previous)
+			}
+			blocks = appendClusterBlock(blocks, block)
+			inCZRange = true
+		} else if inCZRange && block.Key >= "cz-" {
+			break
+		}
+		previous = &block
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return blocks, nil
+}
+
+func parseClusterLine(line string) (ccClusterBlock, bool) {
+	fields := strings.Fields(line)
+	if len(fields) < 5 {
+		return ccClusterBlock{}, false
+	}
+	offset, err := strconv.ParseInt(fields[len(fields)-3], 10, 64)
+	if err != nil {
+		return ccClusterBlock{}, false
+	}
+	length, err := strconv.ParseInt(fields[len(fields)-2], 10, 64)
+	if err != nil || length <= 0 {
+		return ccClusterBlock{}, false
+	}
+	return ccClusterBlock{
+		Key:       fields[0],
+		IndexPath: fields[len(fields)-4],
+		Offset:    offset,
+		Length:    length,
+	}, true
+}
+
+func appendClusterBlock(blocks []ccClusterBlock, block ccClusterBlock) []ccClusterBlock {
+	for _, existing := range blocks {
+		if existing.IndexPath == block.IndexPath && existing.Offset == block.Offset {
+			return blocks
+		}
+	}
+	return append(blocks, block)
+}
+
+func (d *Discoverer) scanCommonCrawlRangeBlock(ctx context.Context, crawl ccCrawl, block ccClusterBlock, sink Sink, total *int) error {
+	crawlBlock := CrawlBlock{Source: "commoncrawl", Crawl: crawl.ID, IndexFile: block.IndexPath, Block: block.Offset}
+	if d.config.BlockTracker != nil {
+		complete, err := d.config.BlockTracker.BlockComplete(ctx, crawlBlock)
+		if err != nil {
+			return err
+		}
+		if complete {
+			d.progress("commoncrawl: skipping completed block %s offset=%d\n", path.Base(block.IndexPath), block.Offset)
+			return nil
+		}
+		if err := d.config.BlockTracker.MarkBlockStarted(ctx, crawlBlock); err != nil {
+			return err
+		}
+	}
+
+	rawURL := d.commonCrawlDataURL(block.IndexPath)
+	resp, err := d.getRangeOKWithCooldown(ctx, rawURL, block.Offset, block.Length, "commoncrawl cdx range", fmt.Sprintf("%s:%d", path.Base(block.IndexPath), block.Offset))
+	if err != nil {
+		if d.config.BlockTracker != nil {
+			_ = d.config.BlockTracker.MarkBlockFailed(ctx, crawlBlock, err)
+		}
+		return err
+	}
+	defer resp.Body.Close()
+	err = d.scanCommonCrawlCDXGzip(ctx, resp.Body, crawlBlock, sink, total, true)
+	if err != nil {
+		if d.config.BlockTracker != nil && !errors.Is(err, errLimitReached) {
+			_ = d.config.BlockTracker.MarkBlockFailed(ctx, crawlBlock, err)
+		}
+		return err
+	}
+	if d.config.BlockTracker != nil {
+		if err := d.config.BlockTracker.MarkBlockCompleted(ctx, crawlBlock); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (d *Discoverer) scanCommonCrawlSequential(ctx context.Context, crawl ccCrawl, cdxPaths []string, sink Sink, total *int) error {
+	before := *total
+	seenCZ := false
+	for i, cdxPath := range cdxPaths {
+		crawlBlock := CrawlBlock{Source: "commoncrawl", Crawl: crawl.ID, IndexFile: cdxPath, Block: 0}
+		if d.config.BlockTracker != nil {
+			complete, err := d.config.BlockTracker.BlockComplete(ctx, crawlBlock)
+			if err != nil {
+				return err
+			}
+			if complete {
+				d.progress("commoncrawl: skipping completed file %d/%d %s\n", i+1, len(cdxPaths), path.Base(cdxPath))
+				continue
+			}
+			if err := d.config.BlockTracker.MarkBlockStarted(ctx, crawlBlock); err != nil {
+				return err
+			}
+		}
+
+		d.progress("commoncrawl: file %d/%d %s (%d new, %d total)\n", i+1, len(cdxPaths), path.Base(cdxPath), *total-before, *total)
+		resp, err := d.getOKWithCooldown(ctx, d.commonCrawlDataURL(cdxPath), "commoncrawl cdx", path.Base(cdxPath))
+		if err != nil {
+			if d.config.BlockTracker != nil {
+				_ = d.config.BlockTracker.MarkBlockFailed(ctx, crawlBlock, err)
+			}
+			return err
+		}
+		hitCZ, passedCZ, scanErr := d.scanCommonCrawlSequentialGzip(ctx, resp.Body, crawlBlock, sink, total)
+		_ = resp.Body.Close()
+		if scanErr != nil {
+			if d.config.BlockTracker != nil && !errors.Is(scanErr, errLimitReached) {
+				_ = d.config.BlockTracker.MarkBlockFailed(ctx, crawlBlock, scanErr)
+			}
+			return scanErr
+		}
+		if d.config.BlockTracker != nil {
+			if err := d.config.BlockTracker.MarkBlockCompleted(ctx, crawlBlock); err != nil {
+				return err
+			}
+		}
+		if hitCZ {
+			seenCZ = true
+		}
+		if seenCZ && passedCZ {
+			d.progress("commoncrawl: sequential scan passed cz, prefix; stopping after %s\n", path.Base(cdxPath))
+			return nil
+		}
+	}
+	return nil
+}
+
+func (d *Discoverer) scanCommonCrawlSequentialGzip(ctx context.Context, r io.Reader, block CrawlBlock, sink Sink, total *int) (bool, bool, error) {
+	gz, err := gzip.NewReader(r)
+	if err != nil {
+		return false, false, err
+	}
+	defer gz.Close()
+	scanner := bufio.NewScanner(gz)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxCommonCrawlLineLength)
+	hitCZ := false
+	passedCZ := false
+	for scanner.Scan() {
+		key := cdxLineKey(scanner.Text())
+		if key >= "cz," && key < "cz-" {
+			hitCZ = true
+			inserted, err := d.addCDXDomain(ctx, scanner.Text(), block, sink, total)
+			if err != nil {
+				return hitCZ, passedCZ, err
+			}
+			if inserted && d.config.Limit > 0 && *total >= d.config.Limit {
+				return hitCZ, passedCZ, errLimitReached
+			}
+			continue
+		}
+		if hitCZ && key >= "cz-" {
+			passedCZ = true
+			break
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return hitCZ, passedCZ, err
+	}
+	return hitCZ, passedCZ, nil
+}
+
+func (d *Discoverer) scanCommonCrawlCDXGzip(ctx context.Context, r io.Reader, block CrawlBlock, sink Sink, total *int, onlyCZ bool) error {
+	gz, err := gzip.NewReader(r)
+	if err != nil {
+		return err
+	}
+	defer gz.Close()
+	scanner := bufio.NewScanner(gz)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxCommonCrawlLineLength)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if onlyCZ && !strings.HasPrefix(line, "cz,") {
+			continue
+		}
+		inserted, err := d.addCDXDomain(ctx, line, block, sink, total)
+		if err != nil {
+			return err
+		}
+		if inserted && d.config.Limit > 0 && *total >= d.config.Limit {
+			return errLimitReached
+		}
+	}
+	return scanner.Err()
+}
+
+func (d *Discoverer) addCDXDomain(ctx context.Context, line string, block CrawlBlock, sink Sink, total *int) (bool, error) {
+	domain, err := domainFromCDXLine(line)
+	if err != nil {
+		return false, nil
+	}
+	inserted, err := sink.AddDomain(ctx, FoundDomain{
+		Domain:    domain,
+		Source:    "commoncrawl",
+		IndexFile: block.IndexFile,
+		Block:     block.Block,
+	})
+	if err != nil {
+		return false, err
+	}
+	if inserted {
+		(*total)++
+	}
+	return inserted, nil
+}
+
+func domainFromCDXLine(line string) (string, error) {
+	return domainFromCDXKey(cdxLineKey(line))
+}
+
+func cdxLineKey(line string) string {
+	if idx := strings.IndexByte(line, ' '); idx >= 0 {
+		return line[:idx]
+	}
+	return line
+}
+
+func domainFromCDXKey(key string) (string, error) {
+	if !strings.HasPrefix(key, "cz,") {
+		return "", domainutil.ErrNotCZDomain
+	}
+	end := strings.Index(key, ")/")
+	if end < 0 {
+		end = strings.IndexByte(key, ')')
+	}
+	if end < 0 {
+		return "", domainutil.ErrNotCZDomain
+	}
+	hostKey := key[:end]
+	parts := strings.Split(hostKey, ",")
+	if len(parts) < 2 || parts[0] != "cz" {
+		return "", domainutil.ErrNotCZDomain
+	}
+	for _, label := range parts[1:] {
+		if label == "" || strings.Contains(label, "_") {
+			return "", domainutil.ErrNotCZDomain
+		}
+	}
+	return domainutil.FromHost(parts[1] + ".cz")
+}
+
+func (d *Discoverer) commonCrawlDataURL(objectPath string) string {
+	base := strings.TrimRight(d.config.CCDataBaseURL, "/")
+	return base + "/" + strings.TrimLeft(objectPath, "/")
+}
+
+func sortCrawls(crawls []ccCrawl) {
+	sort.Slice(crawls, func(i, j int) bool {
+		iy, iw := crawlSortParts(crawls[i].ID)
+		jy, jw := crawlSortParts(crawls[j].ID)
+		if iy != jy {
+			return iy > jy
+		}
+		return iw > jw
+	})
+}
+
+func crawlSortParts(id string) (int, int) {
+	match := crawlIDSortKeyRegexp.FindStringSubmatch(id)
+	if match == nil {
+		return 0, 0
+	}
+	year, _ := strconv.Atoi(match[1])
+	week := 0
+	if match[2] != "" {
+		week, _ = strconv.Atoi(match[2])
+	}
+	return year, week
+}
+
+func dedupeCrawls(crawls []ccCrawl) []ccCrawl {
+	seen := map[string]struct{}{}
+	out := make([]ccCrawl, 0, len(crawls))
+	for _, crawl := range crawls {
+		if _, ok := seen[crawl.ID]; ok {
+			continue
+		}
+		seen[crawl.ID] = struct{}{}
+		out = append(out, crawl)
+	}
+	return out
+}
+
+func crawlIDs(crawls []ccCrawl) string {
+	ids := make([]string, 0, len(crawls))
+	for _, crawl := range crawls {
+		ids = append(ids, crawl.ID)
+	}
+	return strings.Join(ids, ", ")
 }
 
 func (d *Discoverer) discoverCRTSh(ctx context.Context, sink Sink) error {
@@ -473,7 +774,7 @@ func (d *Discoverer) discoverCRTSh(ctx context.Context, sink Sink) error {
 			if err != nil {
 				continue
 			}
-			inserted, err := sink.AddDomain(ctx, FoundDomain{Domain: domain, Source: "crtsh", Page: -1})
+			inserted, err := sink.AddDomain(ctx, FoundDomain{Domain: domain, Source: "crtsh", Block: -1})
 			if err != nil {
 				return err
 			}
@@ -493,7 +794,7 @@ func (d *Discoverer) newRequest(ctx context.Context, rawURL string) (*http.Reque
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept", "*/*")
 	req.Header.Set("User-Agent", d.config.UserAgent)
 	return req, nil
 }
@@ -510,6 +811,7 @@ func (d *Discoverer) getOK(ctx context.Context, rawURL string, label string) (*h
 			return nil, lastErr
 		}
 		if attempt < httpAttempts {
+			d.progress("commoncrawl: retrying %s after transient error: %v\n", label, err)
 			if err := sleepBeforeRetry(ctx, attempt); err != nil {
 				return nil, err
 			}
@@ -540,6 +842,39 @@ func (d *Discoverer) getOKWithCooldown(ctx context.Context, rawURL string, label
 			continue
 		}
 		if attempt < httpAttempts {
+			d.progress("commoncrawl: retrying %s after transient error: %v\n", retryLabel, err)
+			if err := sleepBeforeRetry(ctx, attempt); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		attempt = 0
+	}
+}
+
+func (d *Discoverer) getRangeOKWithCooldown(ctx context.Context, rawURL string, offset int64, length int64, label string, retryLabel string) (*http.Response, error) {
+	var lastErr error
+	transientFailures := 0
+	cooldowns := 0
+	for attempt := 1; ; attempt++ {
+		resp, err := d.doRangeRequest(ctx, rawURL, offset, length, label)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		if !isTransientError(err) {
+			return nil, lastErr
+		}
+		cooledDown, cooldownErr := d.cooldownAfterTransient(ctx, retryLabel, err, &transientFailures, &cooldowns)
+		if cooldownErr != nil {
+			return nil, cooldownErr
+		}
+		if cooledDown {
+			attempt = 0
+			continue
+		}
+		if attempt < httpAttempts {
+			d.progress("commoncrawl: retrying %s after transient error: %v\n", retryLabel, err)
 			if err := sleepBeforeRetry(ctx, attempt); err != nil {
 				return nil, err
 			}
@@ -559,6 +894,30 @@ func (d *Discoverer) doRequest(ctx context.Context, rawURL string, label string)
 		return nil, err
 	}
 	if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
+		return resp, nil
+	}
+	statusErr := httpStatusError{
+		label:      label,
+		status:     resp.StatusCode,
+		retryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
+	}
+	if resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	return nil, statusErr
+}
+
+func (d *Discoverer) doRangeRequest(ctx context.Context, rawURL string, offset int64, length int64, label string) (*http.Response, error) {
+	req, err := d.newRequest(ctx, rawURL)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == http.StatusPartialContent {
 		return resp, nil
 	}
 	statusErr := httpStatusError{
@@ -653,7 +1012,7 @@ func (d *Discoverer) cooldownAfterTransient(ctx context.Context, retryLabel stri
 	if duration <= 0 {
 		duration = d.config.CCCooldown
 	}
-	d.progress("commoncrawl: transient failures %d/%d, cooling down for %s: %v\n", d.config.CCFailThreshold, d.config.CCFailThreshold, duration.Round(time.Second), err)
+	d.progress("commoncrawl: transient failures %d/%d, cooling down for %s before retrying %s: %v\n", d.config.CCFailThreshold, d.config.CCFailThreshold, duration.Round(time.Second), retryLabel, err)
 	waitErr := d.config.CooldownWait(ctx, duration, d.config.CCWaitProgress, func(remaining time.Duration) {
 		if remaining < 0 {
 			remaining = 0

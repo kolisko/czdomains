@@ -115,8 +115,8 @@ func runDiscover(args []string) error {
 	dbPath := flags.String("db", "czdomains.sqlite", "SQLite discovery database path")
 	outPath := flags.String("out", "", "optional TXT output path for newly discovered domains")
 	sources := flags.String("source", "commoncrawl", "comma-separated sources: commoncrawl,crtsh")
-	ccIndex := flags.String("cc-index", "latest", "Common Crawl index id, URL, or latest")
-	ccIndexCount := flags.Int("cc-index-count", 0, "number of recent Common Crawl indexes to scan when --cc-index=latest; 0 scans all")
+	ccIndex := flags.String("cc-index", "latest", "Common Crawl crawl id (for example CC-MAIN-2026-25) or latest")
+	ccIndexCount := flags.Int("cc-index-count", 0, "number of recent Common Crawl crawls to scan when --cc-index=latest; 0 scans the newest crawl")
 	fresh := flags.Bool("fresh", false, "start from a fresh database and truncate --out if set")
 	timeout := flags.Duration("timeout", 60*time.Second, "HTTP timeout")
 	ccRetry := addCommonCrawlRetryFlags(flags)
@@ -204,8 +204,8 @@ func runAll(args []string) error {
 	csvPath := flags.String("csv", "domains.csv", "CSV output path")
 	jsonlPath := flags.String("jsonl", "domains.jsonl", "JSONL output path")
 	sources := flags.String("source", "commoncrawl", "comma-separated sources: commoncrawl,crtsh")
-	ccIndex := flags.String("cc-index", "latest", "Common Crawl index id, URL, or latest")
-	ccIndexCount := flags.Int("cc-index-count", 0, "number of recent Common Crawl indexes to scan when --cc-index=latest; 0 scans all")
+	ccIndex := flags.String("cc-index", "latest", "Common Crawl crawl id (for example CC-MAIN-2026-25) or latest")
+	ccIndexCount := flags.Int("cc-index-count", 0, "number of recent Common Crawl crawls to scan when --cc-index=latest; 0 scans the newest crawl")
 	fresh := flags.Bool("fresh", false, "start from a fresh database")
 	delay := flags.Duration("delay", 200*time.Millisecond, "delay between RDAP requests")
 	timeout := flags.Duration("timeout", 60*time.Second, "HTTP timeout")
@@ -250,13 +250,14 @@ func discoverToSQLite(ctx context.Context, dbPath string, outPath string, fresh 
 	defer sink.Close()
 
 	client := &http.Client{Timeout: timeout}
+	fmt.Fprintf(os.Stderr, "discovery: db=%s limit=%d sources=%s cc-index=%s cc-index-count=%d\n", dbPath, limit, sources, ccIndex, ccIndexCount)
 	discoverer := discovery.New(client, discovery.Config{
 		Limit:           limit,
 		Sources:         splitCSV(sources),
 		CCIndex:         ccIndex,
 		CCIndexCount:    ccIndexCount,
 		UserAgent:       userAgent,
-		PageTracker:     store,
+		BlockTracker:    store,
 		CCFailThreshold: ccRetry.failThreshold,
 		CCCooldown:      ccRetry.cooldown,
 		CCWaitProgress:  ccRetry.waitProgress,
@@ -518,6 +519,7 @@ Discovery:
   --db       SQLite database for dedupe, checkpoints, and resume
   --out      Optional TXT stream of newly inserted domains only
   --fresh    Delete the old database first and truncate --out if set
+  Common Crawl reads data files from data.commoncrawl.org and reports each step on stderr.
   Common Crawl waits by default after repeated transient failures:
     --cc-fail-threshold 3, --cc-cooldown 15m, --cc-wait-progress 1s
     --cc-max-cooldowns 0 means wait indefinitely.
@@ -528,7 +530,7 @@ Export:
   With --out, export writes domains to the given TXT file.
 
 Sources:
-  commoncrawl  Common Crawl CDX index, default
+  commoncrawl  Common Crawl data indexes, default
   crtsh        crt.sh certificate search, optional and often rate-limited
 
 Updates:

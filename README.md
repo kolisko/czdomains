@@ -23,7 +23,7 @@ czdomains update
 
 The update command downloads the matching release asset for your OS/architecture, verifies the GitHub asset digest when available, replaces the current binary, and cleans up its temporary download file.
 
-`discover` stores domains in SQLite by default. This keeps memory usage bounded, deduplicates domains across all sources and Common Crawl indexes, and allows the next run to resume from already completed pages.
+`discover` stores domains in SQLite by default. This keeps memory usage bounded, deduplicates domains across all sources and Common Crawl data indexes, and allows the next run to resume from already completed index blocks.
 
 Use `--fresh` when you explicitly want to delete the previous database and start again:
 
@@ -31,13 +31,13 @@ Use `--fresh` when you explicitly want to delete the previous database and start
 czdomains discover --fresh --limit 10000 --db czdomains.sqlite
 ```
 
-The default discovery source is Common Crawl.
+The default discovery source is Common Crawl. `czdomains` reads Common Crawl data files from `data.commoncrawl.org`: it resolves a crawl, downloads `cc-index.paths.gz`, uses `cluster.idx` when available to fetch only relevant `cdx-*.gz` byte ranges, and falls back to sequential CDX streaming if needed.
 
 ```sh
 czdomains discover --source commoncrawl --limit 1000
 ```
 
-When using `--cc-index latest`, `czdomains` scans Common Crawl indexes until it reaches `--limit` or runs out of available indexes. By default it scans every available Common Crawl index. Use `--cc-index-count N` to limit discovery to the newest `N` indexes for quicker test runs:
+When using `--cc-index latest`, `czdomains` first tries the official structured Common Crawl crawl list and falls back to the data index HTML page if that lookup fails. By default it scans the newest crawl. Use `--cc-index-count N` to scan the newest `N` crawls:
 
 ```sh
 czdomains discover --limit 1000000 --db czdomains.sqlite
@@ -52,7 +52,9 @@ The retry defaults can be tuned when needed:
 czdomains discover --cc-fail-threshold 3 --cc-cooldown 15m --cc-wait-progress 1s --cc-max-cooldowns 0
 ```
 
-`--cc-max-cooldowns 0` means wait indefinitely until the request succeeds or the process is interrupted. Common Crawl `pageSize` is intentionally kept unchanged for checkpoint compatibility with existing SQLite databases.
+`--cc-max-cooldowns 0` means wait indefinitely until the request succeeds or the process is interrupted.
+
+Discovery progress is written to stderr so stdout remains safe for exports and pipelines. Common Crawl discovery reports the crawl-list source, selected crawl IDs, manifest URL, number of CDX files, whether `cluster.idx` is available, scan mode, current block or file, inserted domain counts, retries, cooldowns, and final database totals.
 
 You can add `crt.sh`, but it is often rate-limited or temporarily unavailable:
 
@@ -96,9 +98,9 @@ Discovery is designed for large best-effort runs:
 
 - Domains are written into SQLite as they are found.
 - Uniqueness is enforced by the database primary key, not an in-memory map.
-- Completed Common Crawl pages are checkpointed and skipped on later runs.
+- Completed Common Crawl blocks/files are checkpointed and skipped on later runs.
 - Transient Common Crawl failures trigger a default cooldown and retry the same request.
-- HTTP failures that remain after configured cooldown limits are recorded per page and do not discard already discovered domains.
+- HTTP failures that remain after configured cooldown limits are recorded per block/file and do not discard already discovered domains.
 
 RDAP enrichment is intentionally rate-limited because it queries CZ.NIC RDAP per domain. For very large databases, expect enrichment to take much longer than discovery.
 

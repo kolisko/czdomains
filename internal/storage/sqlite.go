@@ -63,23 +63,24 @@ func (s *Store) init(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS domains (
 			domain TEXT PRIMARY KEY,
 			first_seen_source TEXT NOT NULL,
-			first_seen_index TEXT,
-			first_seen_page INTEGER,
+			first_seen_index_file TEXT,
+			first_seen_block INTEGER,
 			first_seen_at TEXT NOT NULL
 		)`,
-		`CREATE TABLE IF NOT EXISTS crawl_pages (
+		`CREATE TABLE IF NOT EXISTS crawl_blocks (
 			source TEXT NOT NULL,
-			index_url TEXT NOT NULL,
-			page INTEGER NOT NULL,
+			crawl TEXT NOT NULL,
+			index_file TEXT NOT NULL,
+			block INTEGER NOT NULL,
 			status TEXT NOT NULL,
 			attempts INTEGER NOT NULL DEFAULT 0,
 			last_error TEXT,
 			started_at TEXT,
 			completed_at TEXT,
-			PRIMARY KEY (source, index_url, page)
+			PRIMARY KEY (source, crawl, index_file, block)
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_domains_seen ON domains(first_seen_source, first_seen_index)`,
-		`CREATE INDEX IF NOT EXISTS idx_crawl_pages_status ON crawl_pages(status)`,
+		`CREATE INDEX IF NOT EXISTS idx_domains_seen ON domains(first_seen_source, first_seen_index_file)`,
+		`CREATE INDEX IF NOT EXISTS idx_crawl_blocks_status ON crawl_blocks(status)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -99,8 +100,8 @@ func (s *Store) AddDomain(ctx context.Context, domain discovery.FoundDomain) (bo
 	result, err := s.insertStmt.ExecContext(ctx,
 		domain.Domain,
 		domain.Source,
-		nullableString(domain.IndexURL),
-		nullableInt(domain.Page),
+		nullableString(domain.IndexFile),
+		nullableBlock(domain.Block),
 		time.Now().UTC().Format(time.RFC3339),
 	)
 	if err != nil {
@@ -128,7 +129,7 @@ func (s *Store) ensureInsertTx(ctx context.Context) error {
 		return err
 	}
 	stmt, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO domains
-		(domain, first_seen_source, first_seen_index, first_seen_page, first_seen_at)
+		(domain, first_seen_source, first_seen_index_file, first_seen_block, first_seen_at)
 		VALUES (?, ?, ?, ?, ?)`)
 	if err != nil {
 		_ = tx.Rollback()
@@ -178,14 +179,14 @@ func (s *Store) Count(ctx context.Context) (int, error) {
 	return count, nil
 }
 
-func (s *Store) PageComplete(ctx context.Context, page discovery.CrawlPage) (bool, error) {
+func (s *Store) BlockComplete(ctx context.Context, block discovery.CrawlBlock) (bool, error) {
 	if err := s.Flush(); err != nil {
 		return false, err
 	}
 	var status string
-	err := s.db.QueryRowContext(ctx, `SELECT status FROM crawl_pages
-		WHERE source = ? AND index_url = ? AND page = ?`,
-		page.Source, page.IndexURL, page.Page,
+	err := s.db.QueryRowContext(ctx, `SELECT status FROM crawl_blocks
+		WHERE source = ? AND crawl = ? AND index_file = ? AND block = ?`,
+		block.Source, block.Crawl, block.IndexFile, block.Block,
 	).Scan(&status)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
@@ -196,51 +197,51 @@ func (s *Store) PageComplete(ctx context.Context, page discovery.CrawlPage) (boo
 	return status == "completed", nil
 }
 
-func (s *Store) MarkPageStarted(ctx context.Context, page discovery.CrawlPage) error {
+func (s *Store) MarkBlockStarted(ctx context.Context, block discovery.CrawlBlock) error {
 	if err := s.Flush(); err != nil {
 		return err
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO crawl_pages
-		(source, index_url, page, status, attempts, started_at)
-		VALUES (?, ?, ?, 'running', 1, ?)
-		ON CONFLICT(source, index_url, page) DO UPDATE SET
+	_, err := s.db.ExecContext(ctx, `INSERT INTO crawl_blocks
+		(source, crawl, index_file, block, status, attempts, started_at)
+		VALUES (?, ?, ?, ?, 'running', 1, ?)
+		ON CONFLICT(source, crawl, index_file, block) DO UPDATE SET
 			status = 'running',
 			attempts = attempts + 1,
 			started_at = excluded.started_at,
 			last_error = NULL`,
-		page.Source, page.IndexURL, page.Page, time.Now().UTC().Format(time.RFC3339),
+		block.Source, block.Crawl, block.IndexFile, block.Block, time.Now().UTC().Format(time.RFC3339),
 	)
 	return err
 }
 
-func (s *Store) MarkPageCompleted(ctx context.Context, page discovery.CrawlPage) error {
+func (s *Store) MarkBlockCompleted(ctx context.Context, block discovery.CrawlBlock) error {
 	if err := s.Flush(); err != nil {
 		return err
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO crawl_pages
-		(source, index_url, page, status, attempts, completed_at)
-		VALUES (?, ?, ?, 'completed', 1, ?)
-		ON CONFLICT(source, index_url, page) DO UPDATE SET
+	_, err := s.db.ExecContext(ctx, `INSERT INTO crawl_blocks
+		(source, crawl, index_file, block, status, attempts, completed_at)
+		VALUES (?, ?, ?, ?, 'completed', 1, ?)
+		ON CONFLICT(source, crawl, index_file, block) DO UPDATE SET
 			status = 'completed',
 			completed_at = excluded.completed_at,
 			last_error = NULL`,
-		page.Source, page.IndexURL, page.Page, time.Now().UTC().Format(time.RFC3339),
+		block.Source, block.Crawl, block.IndexFile, block.Block, time.Now().UTC().Format(time.RFC3339),
 	)
 	return err
 }
 
-func (s *Store) MarkPageFailed(ctx context.Context, page discovery.CrawlPage, pageErr error) error {
+func (s *Store) MarkBlockFailed(ctx context.Context, block discovery.CrawlBlock, blockErr error) error {
 	if err := s.Flush(); err != nil {
 		return err
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO crawl_pages
-		(source, index_url, page, status, attempts, last_error, completed_at)
-		VALUES (?, ?, ?, 'failed', 1, ?, ?)
-		ON CONFLICT(source, index_url, page) DO UPDATE SET
+	_, err := s.db.ExecContext(ctx, `INSERT INTO crawl_blocks
+		(source, crawl, index_file, block, status, attempts, last_error, completed_at)
+		VALUES (?, ?, ?, ?, 'failed', 1, ?, ?)
+		ON CONFLICT(source, crawl, index_file, block) DO UPDATE SET
 			status = 'failed',
 			last_error = excluded.last_error,
 			completed_at = excluded.completed_at`,
-		page.Source, page.IndexURL, page.Page, fmt.Sprint(pageErr), time.Now().UTC().Format(time.RFC3339),
+		block.Source, block.Crawl, block.IndexFile, block.Block, fmt.Sprint(blockErr), time.Now().UTC().Format(time.RFC3339),
 	)
 	return err
 }
@@ -273,7 +274,7 @@ func nullableString(value string) any {
 	return value
 }
 
-func nullableInt(value int) any {
+func nullableBlock(value int64) any {
 	if value < 0 {
 		return nil
 	}

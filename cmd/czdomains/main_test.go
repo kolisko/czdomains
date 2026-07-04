@@ -40,7 +40,7 @@ func TestExportDomainsWritesOnlyDomains(t *testing.T) {
 
 	ctx := context.Background()
 	for _, domain := range []string{"seznam.cz", "example.cz"} {
-		_, err := store.AddDomain(ctx, discovery.FoundDomain{Domain: domain, Source: "test", Page: -1})
+		_, err := store.AddDomain(ctx, discovery.FoundDomain{Domain: domain, Source: "test", Block: -1})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -70,7 +70,7 @@ func TestExportDomainsWritesToWriter(t *testing.T) {
 
 	ctx := context.Background()
 	for _, domain := range []string{"seznam.cz", "example.cz"} {
-		_, err := store.AddDomain(ctx, discovery.FoundDomain{Domain: domain, Source: "test", Page: -1})
+		_, err := store.AddDomain(ctx, discovery.FoundDomain{Domain: domain, Source: "test", Block: -1})
 		if err != nil {
 			t.Fatal(err)
 		}
